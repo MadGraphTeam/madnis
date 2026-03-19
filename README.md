@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/madgraph-ml/madnis/raw/main/docs/source/_static/logo-light.png" width="450", alt="MadNIS">
+  <img src="https://github.com/MadGraphTeam/madnis/raw/main/docs/source/_static/logo-light.png" width="450", alt="MadNIS">
 </p>
 
 <h2 align="center">Neural Multi-Channel Importance Sampling</h2>
@@ -33,7 +33,7 @@ or clone the repository and install the package in dev mode
 
 ```sh
 # clone the repository
-git clone https://github.com/madgraph-ml/madnis.git
+git clone https://github.com/MadGraphTeam/madnis.git
 # then install in dev mode
 cd madnis
 pip install --editable .
