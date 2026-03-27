@@ -811,6 +811,7 @@ class Integrator(nn.Module):
         train: bool = False,
         channel_weight_mode: Literal["variance", "mean"] = "variance",
         channel: int | None = None,
+        evaluate_integrand: bool = True,
     ) -> SampleBatch:
         """
         Draws samples from the flow and evaluates the integrand
@@ -824,6 +825,8 @@ class Integrator(nn.Module):
             channel_weight_mode: specifies whether the channels are weighted by their mean or
                 variance. Note that weighting by mean can lead to problems for non-positive functions
             channel: if different from None, samples are only generated for this channel
+            evaluate_integrand: If False, the integrand is not evaluated and weight, y and alphas_prior are set to dummy values. This can be used when integrand
+                is expensive and one only needs the flow prob.
         Returns:
             Object containing a batch of samples
         """
@@ -873,7 +876,12 @@ class Integrator(nn.Module):
                         device=self.dummy.device,
                         dtype=self.dummy.dtype,
                     )
-                weight, y, alphas_prior = self.integrand(x, channels)
+                if evaluate_integrand:
+                    weight, y, alphas_prior = self.integrand(x, channels)
+                else:
+                    weight = torch.zeros((x.shape[0]), device=x.device, dtype=x.dtype)
+                    y = None
+                    alphas_prior = None
 
                 if self.group_channels and not self.group_channels_uniform:
                     chan_in_group = x[:, self.channel_group_dim].long()

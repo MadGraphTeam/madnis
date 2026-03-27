@@ -310,6 +310,7 @@ class VegasPreTraining:
         batch_size: int = 100000,
         channel_weight_mode: Literal["uniform", "mean", "variance"] = "variance",
         channel: int | None = None,
+        evaluate_integrand: bool = True,
     ) -> SampleBatch:
         """
         Draws samples and computes their integration weight
@@ -321,6 +322,8 @@ class VegasPreTraining:
                 variance or uniformly. Note that weighting by mean can lead to problems for
                 non-positive functions
             channel: if different from None, samples are only generated for this channel
+            evaluate_integrand: If False, the integrand is not evaluated and func_vals, y and alphas are set to dummy values. This can be used when integrand
+                is expensive and one only needs the mapping jacobian.
         Returns:
             ``SampleBatch`` object, see its documentation for details
         """
@@ -374,15 +377,21 @@ class VegasPreTraining:
             else:
                 channels = None
 
-            func_vals, y, alphas = self.integrand(
-                x_torch,
-                (
-                    channels
-                    if not self.integrator.group_channels
-                    or self.integrator.group_channels_uniform
-                    else integration_channels
-                ),
-            )
+            if evaluate_integrand:
+                func_vals, y, alphas = self.integrand(
+                    x_torch,
+                    (
+                        channels
+                        if not self.integrator.group_channels
+                        or self.integrator.group_channels_uniform
+                        else integration_channels
+                    ),
+                )
+            else:
+                func_vals = torch.zeros((x.shape[0]), dtype=self.integrator.dummy.dtype)
+                y = torch.zeros_like(x_torch)
+                alphas = torch.zeros_like(x_torch)
+
             if (
                 self.integrator.group_channels
                 and not self.integrator.group_channels_uniform
