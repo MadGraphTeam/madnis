@@ -1112,6 +1112,7 @@ class Integrator(nn.Module):
         batch_size: int = 100000,
         channel_weight_mode: Literal["uniform", "mean", "variance"] = "variance",
         channel: int | None = None,
+        evaluate_integrand: bool = True,
     ) -> SampleBatch:
         """
         Draws samples and computes their integration weight
@@ -1140,6 +1141,7 @@ class Integrator(nn.Module):
                 False,
                 channel_weight_mode,
                 channel,
+                evaluate_integrand=evaluate_integrand,
             )
             if self.multichannel:
                 with torch.no_grad():
