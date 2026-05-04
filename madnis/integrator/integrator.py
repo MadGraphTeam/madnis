@@ -879,9 +879,8 @@ class Integrator(nn.Module):
                 if evaluate_integrand:
                     weight, y, alphas_prior = self.integrand(x, channels)
                 else:
-                    weight = torch.zeros((x.shape[0]), device=x.device, dtype=x.dtype)
-                    y = None
-                    alphas_prior = None
+                    weight, y, alphas_prior = self.integrand.function_dummy(x, channels)
+                    weight = torch.ones((x.shape[0]), device=x.device, dtype=x.dtype)
 
                 if self.group_channels and not self.group_channels_uniform:
                     chan_in_group = x[:, self.channel_group_dim].long()
@@ -1112,6 +1111,7 @@ class Integrator(nn.Module):
         batch_size: int = 100000,
         channel_weight_mode: Literal["uniform", "mean", "variance"] = "variance",
         channel: int | None = None,
+        evaluate_integrand: bool = True,
     ) -> SampleBatch:
         """
         Draws samples and computes their integration weight
@@ -1140,6 +1140,7 @@ class Integrator(nn.Module):
                 False,
                 channel_weight_mode,
                 channel,
+                evaluate_integrand=evaluate_integrand,
             )
             if self.multichannel:
                 with torch.no_grad():
