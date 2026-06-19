@@ -29,7 +29,7 @@ class MixedFlow(nn.Module, Distribution):
             self.discrete_dims_first = False
         else:
             raise ValueError("discrete_dims_position must be 'first' or 'last'")
-        self.dims_in_continuous = dims_in_discrete
+        self.dims_in_continuous = dims_in_continuous
         self.dims_in_discrete = len(dims_in_discrete)
         if self.discrete_dims_first:
             dims_c_discrete = dims_c
@@ -122,7 +122,7 @@ class MixedFlow(nn.Module, Distribution):
                 x_continuous if c is None else torch.cat((c, x_continuous), dim=1)
             )
             log_prob_discrete = self.discrete_flow.log_prob(
-                x[:, self.dim_in_continuous].long(), c=condition, channel=channel
+                x[:, self.dims_in_continuous :].long(), c=condition, channel=channel
             )
         return log_prob_discrete + log_prob_continuous
 
@@ -176,7 +176,7 @@ class MixedFlow(nn.Module, Distribution):
                 device=device,
                 dtype=dtype,
             )
-            x = torch.cat((x_continuous.to(x_continuous.dtype), x_discrete), dim=1)
+            x = torch.cat((x_continuous, x_discrete.to(x_continuous.dtype)), dim=1)
 
         extra_returns = []
         if return_log_prob:
