@@ -29,6 +29,7 @@ class Integrand(nn.Module):
         discrete_prior_prob_function: (
             Callable[[torch.Tensor, int], torch.Tensor] | None
         ) = None,
+        function_dummy: Callable | None = None,
     ):
         """
         Args:
@@ -78,7 +79,7 @@ class Integrand(nn.Module):
         self.discrete_dims = discrete_dims
         self.discrete_dims_position = discrete_dims_position
         self.discrete_prior_prob_function = discrete_prior_prob_function
-
+        self.function_dummy = function_dummy
         if function_includes_sampling:
             self.function = function
         elif channel_count is None:
