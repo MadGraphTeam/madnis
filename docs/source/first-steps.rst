@@ -129,16 +129,21 @@ Its output is
 .. code-block:: text
 
     UnweightingMetrics(cut_eff=1.0,
-                       uweff_before_cuts=0.5381982922554016,
-                       uweff_before_cuts_partial=0.5381982922554016,
-                       uweff_after_cuts=0.5381982922554016,
-                       uweff_after_cuts_partial=0.5381982922554016,
-                       over_weight_rate=0.0)
+                       uweff_before_cuts=0.6477954983711243,
+                       uweff_before_cuts_partial=0.647264301776886,
+                       uweff_after_cuts=0.6477954983711243,
+                       uweff_after_cuts_partial=0.647264301776886,
+                       over_weight_rate=0.005941)
 
-From this object, we can read the unweighting efficiency, here around 54%. This tells us which
+From this object, we can read the unweighting efficiency, here around 65%. This tells us which
 fraction of our (weighted) samples would remain if we applied an accept-reject step based on their
-weights. In case we have regions in our integration domain where the integrand is zero, the cut
-efficiency tells us how well our sampler was able to avoid these regions.
+weights. The maximum weight for this accept-reject step is chosen as in MadGraph7. Events with
+larger weights are kept as over-weight events with a weight above one, and the maximum weight is
+set such that they make up about 1% of the unweighted events. This fraction can be changed with
+the argument ``max_overweight_truncation``. The ``partial`` efficiencies count every over-weight
+event once, which is the unweighting efficiency reported by MadGraph7, while the other ones count
+them with their weight. In case we have regions in our integration domain where the integrand is
+zero, the cut efficiency tells us how well our sampler was able to avoid these regions.
 
 Generating samples
 ------------------
@@ -222,3 +227,10 @@ are performed after every training step on fresh samples.
 We printed the relative standard-deviation to compare the performance with the previous results. As
 you can see, they are similar, even though we have reduced the number of calls to our integrand
 function by a factor of four.
+
+The buffer can be filled more efficiently with ``buffer_unweighting_quantile``. Before the samples
+are stored, they are partially unweighted, using the given quantile of the absolute weights in
+every batch as maximum weight. Samples with small weights are mostly discarded, while samples with
+large weights are always kept. The sampling probabilities of the stored samples are rescaled such
+that the buffered training remains unbiased. This is the strategy used by MadGraph7, with a
+quantile of 0.95.

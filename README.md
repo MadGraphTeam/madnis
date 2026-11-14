@@ -5,7 +5,8 @@
 <h2 align="center">Neural Multi-Channel Importance Sampling</h2>
 
 <p align="center">
-<img alt="Build Status" src="https://github.com/madgraph-ml/madnis/actions/workflows/CI.yml/badge.svg">
+<a href="https://github.com/MadGraphTeam/madnis/actions/workflows/CI.yml"><img alt="Build Status" src="https://github.com/MadGraphTeam/madnis/actions/workflows/CI.yml/badge.svg?branch=main"></a>
+<img alt="Coverage" src="https://img.shields.io/badge/coverage-100%25-brightgreen.svg">
 <a href="https://arxiv.org/abs/2311.01548"><img alt="Arxiv" src="https://img.shields.io/badge/arXiv-2311.01548-b31b1b.svg"></a>
 <a href="https://github.com/psf/black"><img alt="Code style: black" src="https://img.shields.io/badge/code%20style-black-000000.svg"></a>
 <a href="https://pytorch.org"><img alt="pytorch" src="https://img.shields.io/badge/PyTorch-2.0-DC583A.svg?style=flat&logo=pytorch"></a>
@@ -19,7 +20,7 @@ integration and importance sampling tasks.
 This repository contains a refactored version of the code used in our publication *The MadNIS
 reloaded*. It is still under active development and will receive frequent updates and bugfixes.
 
-The documentation of the madnis package can be found under [docs.madnis.ai](https://docs.madnis.ai).
+The documentation of the madnis package can be found under [madnis.madgraph.org](https://madnis.madgraph.org).
 
 ## Installation
 

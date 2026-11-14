@@ -143,6 +143,7 @@ class StackedMLP(nn.Module):
         x = x.reshape(self.channels, batch_size // self.channels, x.shape[1])
         for w, b in zip(self.weights[:-1], self.biases[:-1]):
             x = self.activation(torch.baddbmm(b[:, None, :], x, w.transpose(1, 2)))
+        w, b = self.weights[-1], self.biases[-1]
         return torch.baddbmm(b[:, None, :], x, w.transpose(1, 2)).reshape(
             batch_size, -1
         )

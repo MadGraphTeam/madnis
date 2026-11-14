@@ -86,7 +86,8 @@ class MaskedMLP(nn.Module):
     def reset_parameters(self):
         for chan_weights, chan_biases in zip(self.weights, self.biases):
             for weight, bias in zip(chan_weights[:-1], chan_biases[:-1]):
-                torch.nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+                if weight.numel() > 0:
+                    torch.nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
                 fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(weight)
                 bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
                 torch.nn.init.uniform_(bias, -bound, bound)
@@ -115,7 +116,7 @@ class MaskedMLP(nn.Module):
             return torch.cat(
                 [
                     self._forward_single(xi, i)
-                    for i, xi in enumerate(x.split(self.channels, dim=0))
+                    for i, xi in enumerate(x.split(x.shape[0] // self.channels, dim=0))
                 ],
                 dim=0,
             )
@@ -152,7 +153,7 @@ class MaskedMLP(nn.Module):
                 *[
                     self._forward_cached_single(xi, feature, cache, i)
                     for i, (xi, cache) in enumerate(
-                        zip(x.split(self.channels, dim=0), caches)
+                        zip(x.split(x.shape[0] // self.channels, dim=0), caches)
                     )
                 ]
             )

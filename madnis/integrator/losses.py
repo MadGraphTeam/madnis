@@ -121,7 +121,7 @@ def stratified_variance_softclip(
         q_sample = q_test
     if channels is None:
         norm = torch.mean(f_true.detach().abs() / q_sample)
-        f_true = softclip(f_true / q_sample / norm) * q_sample * norm
+        f_true = softclip(f_true / q_sample / norm, threshold) * q_sample * norm
         abs_integral = torch.mean(f_true.detach().abs() / q_sample)
         return _variance(f_true, q_test, q_sample) / abs_integral.square()
 
@@ -131,7 +131,7 @@ def stratified_variance_softclip(
         mask = channels == i
         fi, qti, qsi = f_true[mask], q_test[mask], q_sample[mask]
         norm = torch.mean(fi.detach().abs() / qsi)
-        fi = softclip(fi / qsi / norm) * qsi * norm
+        fi = softclip(fi / qsi / norm, threshold) * qsi * norm
         stddev_sum += torch.sqrt(_variance(fi, qti, qsi) + dtype_epsilon(f_true))
         abs_integral += torch.mean(fi.detach().abs() / qsi)
     return (stddev_sum / abs_integral) ** 2
