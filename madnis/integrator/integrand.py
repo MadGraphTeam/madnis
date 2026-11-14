@@ -161,6 +161,9 @@ class Integrand(nn.Module):
     def update_active_channels_mask(self, mask: torch.Tensor) -> None:
         if self.update_active_channels_mask_func is None:
             return
+        if self.channel_grouping is None:
+            self.update_active_channels_mask_func(mask)
+            return
 
         full_mask = mask[
             self.remap_channels(

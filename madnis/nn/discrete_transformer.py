@@ -75,7 +75,7 @@ class DiscreteTransformer(nn.Module, Distribution):
         )
         embedding = x_embed + pos_embed
         if c is not None:
-            embedding += self.c_embedding(c)
+            embedding = embedding + self.c_embedding(c)[:, None, :]
         net_log_probs = self.mlp(self.transformer(embedding, self.causal_mask))
 
         prior_probs = self.prior_mask.expand(x.shape[0], -1, -1).clone()

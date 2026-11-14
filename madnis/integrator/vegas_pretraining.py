@@ -216,18 +216,22 @@ class VegasPreTraining:
                         f_chan - means[chan]
                     ).square().sum() / counts_chan
 
-            self.integrator._store_samples(
-                SampleBatch(
-                    x_torch,
-                    y,
-                    torch.from_numpy(1 / jac),
-                    func_vals,
-                    channels,
-                    alphas,
-                    integration_channels=integration_channels,
-                    zero_counts=zero_counts,
-                ).map(lambda t: t.to(self.integrator.dummy.device))
-            )
+            stored_samples = SampleBatch(
+                x_torch,
+                y,
+                torch.from_numpy(1 / jac),
+                func_vals,
+                channels,
+                alphas,
+                integration_channels=integration_channels,
+            ).map(lambda t: t.to(self.integrator.dummy.device))
+            if zero_counts is not None:
+                # same rescaling of the sampling probabilities as for the online samples
+                stored_samples.zero_counts = zero_counts.to(
+                    self.integrator.dummy.device
+                )
+                stored_samples = self.integrator._rescale_dropped(stored_samples)
+            self.integrator._store_samples(stored_samples)
         self.integrator.integration_history.store(
             means[None], variances[None], counts[None]
         )
@@ -521,7 +525,8 @@ class VegasPreTraining:
         n: int,
         batch_size: int = 100000,
         channel_weight_mode: Literal["uniform", "mean", "variance"] = "mean",
-    ) -> UnweightingMetrics:
+        max_overweight_truncation: float = 0.01,
+    ) -> UnweightingMetrics | tuple[UnweightingMetrics, list[UnweightingMetrics]]:
         """
         Draws samples and computes metrics for the total and channel-wise integration quality.
         This function is only suitable for functions that are non-negative everywhere.
@@ -531,10 +536,17 @@ class VegasPreTraining:
             batch_size: batch size used for sampling and calling the integrand
             channel_weight_mode: specifies whether the channels are weighted by their mean,
                 variance or uniformly.
+            max_overweight_truncation: tolerated fraction of over-weight events, used to
+                determine the maximum weight as in MadGraph7
         Returns:
-            ``UnweightingMetrics`` object, see its documentation for details
+            ``UnweightingMetrics`` object, see its documentation for details. In the
+            multi-channel case, a list of channel-wise ``UnweightingMetrics`` is returned in
+            addition.
         """
         samples = self.sample(n, batch_size, channel_weight_mode)
         return unweighting_metrics(
-            samples.weights, samples.channels, self.integrand.channel_count
+            samples.weights,
+            samples.channels,
+            self.integrand.channel_count,
+            max_overweight_truncation,
         )

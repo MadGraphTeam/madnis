@@ -150,11 +150,16 @@ The MadNIS integrator has two parameters that control how it treats samples with
 of zero. The parameter ``batch_size_threshold`` controls the minimum amount of samples with non-zero
 values per batch relative to the total batch size during the training. More samples are generated
 until the number is above this threshold. In addition, the parameter ``drop_zero_integrands``
-removes samples with zero-integrand value from the optimization. Depending on the loss function,
-this may change the optimization objective. It is especially useful in situations where the
-integrand evaluation more expensive for samples with non-zero weight. In that case, improving the
-training for samples with non-zero weights at the cost of a lower cut efficiency can be beneficial
-for the overall performance.
+removes samples with zero-integrand value from the optimization. It is especially useful in
+situations where the integrand evaluation is more expensive for samples with non-zero weight.
+By default (``rescale_dropped_zeros=True``), the sampling probabilities of the kept samples are
+multiplied by the channel-wise ratio of generated to kept samples, as done in MadGraph7. The kept
+samples then form an unbiased sample of the region with non-zero integrand, and the channel-wise
+means and variances in the loss, the buffered samples and the integration history are consistent
+between channels with different cut efficiencies. With ``rescale_dropped_zeros=False``, the kept
+samples are used with their original sampling probabilities. Their weights are then too large by
+the inverse cut efficiency of their channel, which distorts the relative weight of the channels in
+the multi-channel loss.
 
 Device and data type
 --------------------

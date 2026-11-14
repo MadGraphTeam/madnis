@@ -19,7 +19,7 @@ integration and importance sampling tasks.
 This repository contains a refactored version of the code used in our publication *The MadNIS
 reloaded*. It is still under active development and will receive frequent updates and bugfixes.
 
-The documentation of the madnis package can be found under [docs.madnis.ai](https://docs.madnis.ai).
+The documentation of the madnis package can be found under [madnis.madgraph.org](https://madnis.madgraph.org).
 
 ## Installation
 

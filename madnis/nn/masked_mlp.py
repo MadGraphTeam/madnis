@@ -115,7 +115,7 @@ class MaskedMLP(nn.Module):
             return torch.cat(
                 [
                     self._forward_single(xi, i)
-                    for i, xi in enumerate(x.split(self.channels, dim=0))
+                    for i, xi in enumerate(x.split(x.shape[0] // self.channels, dim=0))
                 ],
                 dim=0,
             )
@@ -152,7 +152,7 @@ class MaskedMLP(nn.Module):
                 *[
                     self._forward_cached_single(xi, feature, cache, i)
                     for i, (xi, cache) in enumerate(
-                        zip(x.split(self.channels, dim=0), caches)
+                        zip(x.split(x.shape[0] // self.channels, dim=0), caches)
                     )
                 ]
             )
