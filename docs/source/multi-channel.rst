@@ -249,10 +249,21 @@ in the middle of the integration space. However this time, only a single normali
 optimized.
 
 Additionally, the constructor of the :py:class:`Integrator <madnis.integrator.Integrator>` class
-also has an argument ``group_channels_in_loss``. This also groups channels in the computation of the
-stratified variance loss, resulting in better numerical stability for trainings with a large number
-of channels. However, it also prevents the optimization of the relative channels weights within a
-group of channels.
+has an argument ``channel_grouping_mode``. With the default value ``"none"``, every channel is
+treated separately in the loss and integration, even if it shares its flow with other channels.
+With ``"uniform"``, the channels of a group are combined in the stratified variance loss and in
+the integration, and the channel within a group is chosen with equal probability. This results in
+better numerical stability for trainings with a large number of channels, but it prevents the
+optimization of the sampling probabilities of the channels within a group.
+
+With ``"learned"``, the channel within a group is sampled by a discrete normalizing flow, which is
+trained together with the continuous flow. The integrand has to provide the corresponding discrete
+dimension as its first discrete dimension, with at least as many options as the largest group,
+for example ``discrete_dims=[2]`` for the example above. The integrand is called with the indices
+of the channels. If a group is smaller than the number of options, larger indices do not
+correspond to a channel and their samples get zero weight. The discrete index is not used as an
+input of the channel weight network, since it labels the channel and is not a coordinate of the
+integration space.
 
 Stratified training
 -------------------

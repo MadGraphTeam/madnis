@@ -7,6 +7,7 @@ from madnis.integrator import Integrand, Integrator, VegasPreTraining
 
 from .test_integrator import (
     PEAK_INTEGRAL,
+    grouped_integrand,
     SIGMA,
     TWO_PEAKS_INTEGRAL,
     assert_compatible,
@@ -81,3 +82,18 @@ def test_vegas_training_fills_buffer():
     assert integrator.buffer.size == 15000
     _, _, q, func_vals, *_ = integrator.buffer
     assert_weights_unbiased(func_vals / q, TWO_PEAKS_INTEGRAL)
+
+
+@pytest.mark.parametrize("grouping_mode", ["none", "uniform"])
+def test_vegas_sample_weights_with_grouping(grouping_mode):
+    torch.manual_seed(0)
+    integrator = Integrator(
+        grouped_integrand(),
+        batch_size=512,
+        channel_grouping_mode=grouping_mode,
+        dtype=torch.float64,
+    )
+    vegas = VegasPreTraining(integrator)
+    vegas.train([5000] * 3)
+    assert_compatible(*vegas.integrate(100000), TWO_PEAKS_INTEGRAL)
+    assert_weights_unbiased(vegas.sample(100000).weights, TWO_PEAKS_INTEGRAL)

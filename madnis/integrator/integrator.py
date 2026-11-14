@@ -278,14 +278,23 @@ class Integrator(nn.Module):
             self.integration_channel_count = integrand.unique_channel_count()
             self.group_channels = True
             self.group_channels_uniform = False
+            # The index of the channel within its group is sampled as the first discrete
+            # dimension, which has to be provided by the integrand
             self.channel_group_dim = (
                 0
                 if integrand.discrete_dims_position == "first"
                 else input_dim - len(discrete_dims)
             )
-            # TODO: provide default implementation of discrete prior
-            # discrete_dims.insert(0, max(len(group.channel_indices) for group in integrand.channel_grouping.groups))
-            # input_dim += 1
+            max_group_size = max(
+                len(group.channel_indices)
+                for group in integrand.channel_grouping.groups
+            )
+            if len(discrete_dims) == 0 or discrete_dims[0] < max_group_size:
+                raise ValueError(
+                    "channel_grouping_mode='learned' requires that the first discrete "
+                    "dimension of the integrand encodes the index of the channel within its "
+                    f"group, with at least {max_group_size} options"
+                )
         else:
             raise ValueError(f"Unknown channel grouping mode {channel_grouping_mode}")
 
@@ -366,7 +375,12 @@ class Integrator(nn.Module):
                 )
 
         if cwnet is None and train_channel_weights and self.multichannel:
-            cwnet = MLP(integrand.remapped_dim, integrand.channel_count, **cwnet_kwargs)
+            cwnet_dim = integrand.remapped_dim
+            if self.group_channels and not self.group_channels_uniform:
+                if not integrand.has_remapped_dim:
+                    # the index of the channel within its group is not an input
+                    cwnet_dim -= 1
+            cwnet = MLP(cwnet_dim, integrand.channel_count, **cwnet_kwargs)
         if cwnet is None:
             parameters = flow.parameters()
         else:
@@ -499,10 +513,56 @@ class Integrator(nn.Module):
 
         alpha = alpha_prior * active_channels_mask
         mask = samples.func_vals != 0
-        y = samples.x if samples.y is None else samples.y
+        y = self._cwnet_input(samples)
         alpha[mask] *= self.cwnet(y[mask]).exp()
         ret = alpha / alpha.sum(dim=1, keepdim=True)
         return ret
+
+    def _cwnet_input(self, samples: SampleBatch) -> torch.Tensor:
+        """
+        Returns the input of the channel weight network. This is the remapped point y if the
+        integrand provides it, and otherwise the sampled point x. For learned channel grouping,
+        the index of the channel within its group is removed from x, because it labels the
+        channel and is not a coordinate of the integration space. Otherwise, the channel weights
+        would not be normalized at a fixed point of the integration space, and the integral
+        would be biased.
+
+        Args:
+            samples: batch of samples
+        Returns:
+            input of the channel weight network, shape (n, cwnet input dimension)
+        """
+        if samples.y is not None:
+            return samples.y
+        if self.group_channels and not self.group_channels_uniform:
+            keep = torch.arange(samples.x.shape[1], device=samples.x.device)
+            return samples.x[:, keep != self.channel_group_dim]
+        return samples.x
+
+    def _learned_group_channels(
+        self, x: torch.Tensor, groups: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Determines the channel indices for learned channel grouping, where the index of the
+        channel within its group is sampled as a discrete dimension. If a group is smaller than
+        the number of options of that dimension, the larger indices do not correspond to a
+        channel. These samples are mapped onto the last channel of the group and have to be
+        assigned zero weight.
+
+        Args:
+            x: sampled points, shape (n, input_dim)
+            groups: channel group indices, shape (n, )
+        Returns:
+            A tuple containing
+
+              - channel indices, shape (n, )
+              - mask of the samples with a valid index within the group, shape (n, )
+        """
+        chan_in_group = x[:, self.channel_group_dim].long()
+        group_sizes = self.channel_group_sizes[groups]
+        valid = chan_in_group < group_sizes
+        chan_in_group = torch.minimum(chan_in_group, group_sizes - 1)
+        return self.channel_group_remap[groups, chan_in_group], valid
 
     def _compute_integral(
         self, samples: SampleBatch
@@ -991,19 +1051,22 @@ class Integrator(nn.Module):
                         device=self.dummy.device,
                         dtype=self.dummy.dtype,
                     )
+                valid_channels = None
+                if self.group_channels and not self.group_channels_uniform:
+                    integration_channels = batch_channels
+                    channels, valid_channels = self._learned_group_channels(
+                        x, batch_channels
+                    )
                 if evaluate_integrand:
                     weight, y, alphas_prior = self.integrand(x, channels)
+                    if valid_channels is not None:
+                        weight = torch.where(
+                            valid_channels, weight, torch.zeros_like(weight)
+                        )
                 else:
                     weight = torch.zeros((x.shape[0]), device=x.device, dtype=x.dtype)
                     y = None
                     alphas_prior = None
-
-                if self.group_channels and not self.group_channels_uniform:
-                    chan_in_group = x[:, self.channel_group_dim].long()
-                    integration_channels = batch_channels
-                    channels = self.channel_group_remap[
-                        integration_channels, chan_in_group
-                    ]
 
             if weight_factor is not None:
                 weight *= weight_factor

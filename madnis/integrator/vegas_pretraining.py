@@ -123,11 +123,15 @@ class VegasPreTraining:
             x_torch = torch.as_tensor(x, dtype=self.integrator.dummy.dtype)
             x_torch, jac = self._map_discrete(x_torch, jac)
 
+            valid_channels = None
             if (
                 self.integrator.group_channels
                 and not self.integrator.group_channels_uniform
             ):
-                channels = torch.full((samples_per_channel,), grid_index)
+                # the channel within the group is given by a discrete dimension
+                channels, valid_channels = self.integrator._learned_group_channels(
+                    x_torch, torch.full((samples_per_channel,), grid_index)
+                )
             elif self.integrator.multichannel:
                 # TODO: no need for random numbers here
                 channels = torch.from_numpy(
@@ -137,20 +141,10 @@ class VegasPreTraining:
                 channels = None
 
             func_vals, y, alphas = self.integrand(x_torch, channels)
-            if (
-                self.integrator.group_channels
-                and not self.integrator.group_channels_uniform
-            ):
-                if not self.integrator.group_channels_cdf_mode:
-                    raise NotImplementedError(
-                        "discrete sampling in index mode not supported in VEGAS"
-                    )
-                chan_in_group = (
-                    x_torch[:, self.integrator.channel_group_dim] * len(grid_channels)
-                ).long()
-                channels = self.integrator.channel_group_remap[
-                    grid_index, chan_in_group
-                ]
+            if valid_channels is not None:
+                func_vals = torch.where(
+                    valid_channels, func_vals, torch.zeros_like(func_vals)
+                )
 
             if self.integrator.multichannel:
                 alpha = torch.gather(alphas, index=channels[:, None], dim=1)[:, 0]
@@ -366,7 +360,17 @@ class VegasPreTraining:
             x_torch = torch.as_tensor(x, dtype=self.integrator.dummy.dtype)
             x_torch, jac = self._map_discrete(x_torch, jac)
             integration_channels = None
-            if self.integrator.group_channels:
+            valid_channels = None
+            if (
+                self.integrator.group_channels
+                and not self.integrator.group_channels_uniform
+            ):
+                # the channel within the group is given by a discrete dimension
+                integration_channels = torch.full((n_samples,), grid_index)
+                channels, valid_channels = self.integrator._learned_group_channels(
+                    x_torch, integration_channels
+                )
+            elif self.integrator.group_channels:
                 channels = torch.from_numpy(
                     self.rng.choice(grid_channels, (n_samples,))
                 )
@@ -382,34 +386,15 @@ class VegasPreTraining:
                 channels = None
 
             if evaluate_integrand:
-                func_vals, y, alphas = self.integrand(
-                    x_torch,
-                    (
-                        channels
-                        if not self.integrator.group_channels
-                        or self.integrator.group_channels_uniform
-                        else integration_channels
-                    ),
-                )
+                func_vals, y, alphas = self.integrand(x_torch, channels)
+                if valid_channels is not None:
+                    func_vals = torch.where(
+                        valid_channels, func_vals, torch.zeros_like(func_vals)
+                    )
             else:
                 func_vals = torch.zeros((x.shape[0]), dtype=self.integrator.dummy.dtype)
                 y = torch.zeros_like(x_torch)
                 alphas = torch.zeros_like(x_torch)
-
-            if (
-                self.integrator.group_channels
-                and not self.integrator.group_channels_uniform
-            ):
-                if not self.integrator.group_channels_cdf_mode:
-                    raise NotImplementedError(
-                        "discrete sampling in index mode not supported in VEGAS"
-                    )
-                chan_in_group = (
-                    x_torch[:, self.integrator.channel_group_dim] * len(grid_channels)
-                ).long()
-                channels = self.integrator.channel_group_remap[
-                    grid_index, chan_in_group
-                ]
 
             # TODO: assign channels if importance-sampled
             if (
@@ -441,11 +426,12 @@ class VegasPreTraining:
             )
         cat_samples = SampleBatch.cat(samples)
         if self.integrator.multichannel:
-            norm_factors = len(cat_samples.channels) / torch.bincount(
-                cat_samples.channels,
-                minlength=self.integrator.integration_channel_count,
+            # the samples are generated per integration channel (channel group)
+            channels = self.integrator._batch_channels(cat_samples)
+            norm_factors = len(channels) / torch.bincount(
+                channels, minlength=self.integrator.integration_channel_count
             )
-            cat_samples.weights *= norm_factors[cat_samples.channels]
+            cat_samples.weights *= norm_factors[channels]
         return cat_samples
 
     def _compute_integral(
