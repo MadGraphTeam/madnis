@@ -67,9 +67,10 @@ jobs:
       run: |
         git --no-pager log -2
         python -m pip install --upgrade pip
-        python -m pip install -e .
-        python -m pip install pytest
+        # the vegas extra is needed, otherwise the VEGAS tests are skipped
+        python -m pip install -e ".[vegas]"
+        python -m pip install pytest pytest-cov
 
     - name: Test pytest
       run: |
-        pytest
+        pytest --cov --cov-report=term-missing --cov-fail-under=100

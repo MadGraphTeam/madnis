@@ -29,6 +29,9 @@ vegas = ["vegas"]
 [tool.black]
 line-length = 88
 
+[tool.coverage.run]
+source = ["madnis"]
+
 [tool.isort]
 profile = "black" # https://black.readthedocs.io/en/stable/guides/using_black_with_other_tools.html
 atomic = true
