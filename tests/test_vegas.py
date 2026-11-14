@@ -7,12 +7,12 @@ from madnis.integrator import Integrand, Integrator, VegasPreTraining
 
 from .test_integrator import (
     PEAK_INTEGRAL,
-    grouped_integrand,
     SIGMA,
     TWO_PEAKS_INTEGRAL,
     assert_compatible,
     assert_weights_unbiased,
     gauss_1d_integral,
+    grouped_integrand,
     multichannel_integrand,
     peak,
     two_peaks,
