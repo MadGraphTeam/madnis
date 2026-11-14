@@ -206,3 +206,71 @@ def test_mixed_flow(position, model):
         with torch.no_grad():
             total += flow.log_prob(x_full).exp().mean().item()
     assert abs(total - 1.0) < 0.03
+
+
+@pytest.mark.parametrize("model", ["made", "transformer"])
+def test_discrete_sample_without_extra_returns(model):
+    flow = make_discrete(model)
+    with torch.no_grad():
+        x = flow.sample(10, dtype=torch.float64)
+    assert isinstance(x, torch.Tensor)
+    assert x.shape == (10, len(DIMS))
+
+
+def test_discrete_made_channel_remap_function():
+    torch.manual_seed(0)
+    flow = perturb(
+        DiscreteMADE(DIMS, channels=2, channel_remap_function=lambda c: 1 - c).double(),
+        scale=0.3,
+    )
+    x = all_configurations(DIMS)
+    with torch.no_grad():
+        log_prob_int = flow.log_prob(x, channel=0)
+        log_prob_tensor = flow.log_prob(
+            x, channel=torch.zeros(len(x), dtype=torch.int64)
+        )
+    torch.testing.assert_close(log_prob_int, log_prob_tensor)
+    with pytest.raises(ValueError, match="channel_remap_function"):
+        flow.log_prob(x, channel=[12, 12])
+
+
+def test_masked_mlp_cached_forward_equal_channel_sizes():
+    """cached evaluation with channel=None, i.e. equally sized channels"""
+    input_dims, output_dims = [2, 3, 1], [3, 1, 4]
+    torch.manual_seed(0)
+    net = perturb(MaskedMLP(input_dims, output_dims, channels=3).double())
+    x = torch.rand((6, sum(input_dims)), dtype=torch.float64)
+    with torch.no_grad():
+        full = net(x)
+        cache = None
+        outputs = []
+        for i, x_block in enumerate(x.split(input_dims, dim=1)):
+            y, cache = net.forward_cached(x_block, i, cache)
+            outputs.append(y)
+    torch.testing.assert_close(torch.cat(outputs, dim=1), full)
+
+
+@pytest.mark.parametrize("position", ["first", "last"])
+def test_conditional_mixed_flow(position):
+    torch.manual_seed(0)
+    flow = MixedFlow(
+        dims_in_continuous=2,
+        dims_in_discrete=[2, 3],
+        dims_c=2,
+        discrete_dims_position=position,
+    ).double()
+    perturb(flow)
+    c = torch.rand((1000, 2), dtype=torch.float64)
+    with torch.no_grad():
+        x, prob = flow.sample(c=c, return_prob=True)
+        torch.testing.assert_close(prob.log(), flow.log_prob(x, c=c))
+        assert isinstance(flow.sample(c=c), torch.Tensor)
+
+
+def test_invalid_mixed_flow_options():
+    with pytest.raises(ValueError, match="first"):
+        MixedFlow(2, [3], discrete_dims_position="middle")
+    with pytest.raises(ValueError, match="made"):
+        MixedFlow(2, [3], discrete_model="unknown")
+    with pytest.raises(NotImplementedError, match="single-channel"):
+        MixedFlow(2, [3], discrete_model="transformer", channels=2)

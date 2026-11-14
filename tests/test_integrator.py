@@ -2,11 +2,13 @@
 
 import io
 import math
+import os
+import signal
 
 import pytest
 import torch
 
-from madnis.integrator import ChannelGrouping, Integrand, Integrator
+from madnis.integrator import ChannelGrouping, Integrand, Integrator, SampleBatch
 from madnis.integrator.losses import (
     kl_divergence,
     kl_divergence_softclip,
@@ -14,6 +16,7 @@ from madnis.integrator.losses import (
     stratified_variance,
     variance,
 )
+from madnis.nn import Flow
 
 SIGMA = 0.1
 
@@ -459,3 +462,164 @@ def test_purely_discrete_integrand():
     expected = (1 + 2 + 3) * (1 + 4 + 9 + 16)
     assert_compatible(metrics.integral, metrics.error, expected)
     assert metrics.rel_stddev < 0.2 * rel_stddev_before
+
+
+def test_channel_dropping_removes_buffered_samples():
+    def function(x, channels):
+        f, alphas = two_peaks_with_prior(x, channels)
+        alphas = torch.cat((alphas, torch.full_like(alphas[:, :1], 1e-7)), dim=1)
+        return f, alphas / alphas.sum(dim=1, keepdim=True)
+
+    torch.manual_seed(0)
+    integrand = Integrand(
+        function, input_dim=2, channel_count=3, has_channel_weight_prior=True
+    )
+    integrator = Integrator(
+        integrand,
+        batch_size=512,
+        buffer_capacity=20000,
+        minimum_buffer_size=100000,  # no buffered steps, only storage
+        channel_dropping_threshold=0.01,
+        channel_dropping_interval=20,
+        dtype=torch.float64,
+    )
+    integrator.train(19)
+    buffered = SampleBatch(*integrator.buffer)
+    assert (buffered.channels == 2).any()
+    integrator.train(1)
+    buffered = SampleBatch(*integrator.buffer)
+    assert integrator.buffer.size > 0
+    assert (buffered.channels != 2).all()
+
+
+def test_sample_single_channel():
+    torch.manual_seed(0)
+    integrator = Integrator(multichannel_integrand(), dtype=torch.float64)
+    samples = integrator.sample(1000, channel=1)
+    assert (samples.channels == 1).all()
+
+
+def test_custom_optimizer_and_device():
+    torch.manual_seed(0)
+    integrator = Integrator(
+        peak,
+        dims=2,
+        batch_size=256,
+        optimizer=lambda params: torch.optim.SGD(params, lr=1e-3),
+        device="cpu",
+        dtype=torch.float64,
+    )
+    assert isinstance(integrator.optimizer, torch.optim.SGD)
+    assert integrator.dummy.device.type == "cpu"
+    integrator.train(5)
+
+    flow = Flow(dims_in=2).double()
+    optimizer = torch.optim.Adam(flow.parameters(), lr=1e-3)
+    integrator = Integrator(
+        peak, dims=2, flow=flow, optimizer=optimizer, dtype=torch.float64
+    )
+    assert integrator.optimizer is optimizer
+    integrator.train(5)
+
+
+def test_multichannel_without_prior_and_cwnet():
+    """without prior and channel weight network, the channel weights are uniform"""
+    torch.manual_seed(0)
+    integrand = Integrand(lambda x, c: two_peaks(x), input_dim=2, channel_count=2)
+    integrator = Integrator(
+        integrand, batch_size=512, train_channel_weights=False, dtype=torch.float64
+    )
+    samples = integrator.sample(100)
+    torch.testing.assert_close(
+        integrator._get_alphas(samples), torch.full((100, 2), 0.5, dtype=torch.float64)
+    )
+    integrator.train(20)
+    assert_compatible(*integrator.integrate(100000), TWO_PEAKS_INTEGRAL)
+
+
+def test_nan_loss_skips_optimization():
+    def nan_loss(f_true, q_test, q_sample=None, channels=None):
+        return (q_test * torch.nan).mean()
+
+    torch.manual_seed(0)
+    integrator = Integrator(peak, dims=2, loss=nan_loss, dtype=torch.float64)
+    params = [param.clone() for param in integrator.flow.parameters()]
+    with pytest.warns(UserWarning, match="nan batch"):
+        integrator.train(2)
+    for param, old_param in zip(integrator.flow.parameters(), params):
+        torch.testing.assert_close(param, old_param)
+
+
+def test_capture_keyboard_interrupt():
+    """the training stops after the step during which SIGINT was received"""
+
+    def callback(status):
+        if status.step == 2:
+            os.kill(os.getpid(), signal.SIGINT)
+
+    torch.manual_seed(0)
+    integrator = Integrator(peak, dims=2, batch_size=128, dtype=torch.float64)
+    old_handler = signal.getsignal(signal.SIGINT)
+    integrator.train(10, callback=callback, capture_keyboard_interrupt=True)
+    assert integrator.step == 3
+    assert signal.getsignal(signal.SIGINT) is old_handler
+
+
+def test_sample_batch_split():
+    x = torch.rand((10, 2))
+    batch = SampleBatch(x, None, torch.ones(10), torch.ones(10), None)
+    batches = list(batch.split(4))
+    assert [len(b.x) for b in batches] == [4, 4, 2]
+    torch.testing.assert_close(torch.cat([b.x for b in batches]), x)
+    assert all(b.y is None for b in batches)
+
+
+def test_store_nothing_after_unweighting():
+    torch.manual_seed(0)
+    integrator = Integrator(
+        peak,
+        dims=2,
+        buffer_capacity=100,
+        buffer_unweighting_quantile=0.9,
+        dtype=torch.float64,
+    )
+    x = torch.rand((50, 2), dtype=torch.float64)
+    integrator._store_samples(
+        SampleBatch(x, None, torch.ones(50), torch.zeros(50), None)
+    )
+    assert integrator.buffer.size == 0
+
+
+def test_purely_discrete_transformer():
+    def function(x):
+        return ((1 + x[:, 0]) * (1 + x[:, 1])).double()
+
+    torch.manual_seed(0)
+    integrand = Integrand(function, input_dim=2, discrete_dims=[3, 4])
+    integrator = Integrator(
+        integrand,
+        batch_size=256,
+        discrete_model="transformer",
+        discrete_flow_kwargs=dict(
+            embedding_dim=16, feedforward_dim=32, heads=2, mlp_units=32
+        ),
+        dtype=torch.float64,
+    )
+    integrator.train(20)
+    assert_compatible(*integrator.integrate(50000), 6 * 10)
+
+
+@pytest.mark.parametrize("discrete_dims", [[3, 4], [3]], ids=["discrete", "mixed"])
+def test_invalid_discrete_options(discrete_dims):
+    integrand = Integrand(
+        lambda x, c: x[:, -1], input_dim=2, channel_count=2, discrete_dims=discrete_dims
+    )
+    with pytest.raises(NotImplementedError, match="single-channel"):
+        Integrator(integrand, discrete_model="transformer")
+    with pytest.raises(ValueError, match="made"):
+        Integrator(integrand, discrete_model="unknown")
+
+
+def test_invalid_grouping_mode():
+    with pytest.raises(ValueError, match="grouping mode"):
+        Integrator(grouped_integrand(), channel_grouping_mode="unknown")

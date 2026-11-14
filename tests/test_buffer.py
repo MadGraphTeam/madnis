@@ -87,3 +87,10 @@ def test_state_dict():
     assert loaded.size == 6
     torch.testing.assert_close(list(loaded)[2], torch.arange(6))
     assert len(make_buffer(persistent=False).state_dict()) == 0
+
+
+def test_default_dtypes():
+    buffer = Buffer(5, [(3,), ()])
+    buffer.store(torch.rand((2, 3)), torch.rand(2))
+    assert all(field.dtype == torch.get_default_dtype() for field in buffer)
+    assert buffer.size == 2

@@ -224,3 +224,99 @@ def test_multichannel_flow_normalized():
         error = prob.std() / len(prob) ** 0.5
         assert abs(prob.mean().item() - 1.0) < 5 * error
         assert prob.std() > 0.05
+
+
+def test_return_latent():
+    flow = make_flow("2d")
+    torch.manual_seed(1)
+    with torch.no_grad():
+        x, z = flow.sample(100, return_latent=True, dtype=torch.float64)
+        x_rec, _ = flow.transform(z, inverse=True)
+        prob, z_rec = flow.prob(x, return_latent=True)
+    torch.testing.assert_close(x_rec, x)
+    torch.testing.assert_close(z_rec, z)
+    torch.testing.assert_close(prob, flow.prob(x))
+
+
+def test_channel_remap_function():
+    """channels are remapped for int and tensor arguments, lists are not supported"""
+    torch.manual_seed(0)
+    flow = perturb(
+        Flow(dims_in=2, channels=2, channel_remap_function=lambda c: 1 - c).double()
+    )
+    x = torch.rand((100, 2), dtype=torch.float64)
+    with torch.no_grad():
+        prob_int = flow.prob(x, channel=0)
+        prob_tensor = flow.prob(x, channel=torch.zeros(100, dtype=torch.int64))
+        prob_other = flow.prob(x, channel=1)
+    torch.testing.assert_close(prob_int, prob_tensor)
+    assert not torch.allclose(prob_int, prob_other)
+    with pytest.raises(ValueError, match="channel_remap_function"):
+        flow.prob(x, channel=[50, 50])
+
+
+def test_invalid_permutations():
+    with pytest.raises(ValueError, match="permutation"):
+        Flow(dims_in=3, permutations="unknown")
+
+
+def power_mapping(power: float):
+    """sampling direction (inverse=False): u -> u^power, density direction: x -> x^(1/power)"""
+
+    def mapping(x, inverse):
+        if inverse:
+            u = x ** (1 / power)
+            return u, -((power * u ** (power - 1)).log().sum(dim=1))
+        else:
+            return x**power, (power * x ** (power - 1)).log().sum(dim=1)
+
+    return mapping
+
+
+def test_channel_wise_mappings():
+    """every channel has its own mapping, for all ways of specifying the channels"""
+    torch.manual_seed(0)
+    flow = Flow(
+        dims_in=2, channels=2, mapping=[power_mapping(2.0), power_mapping(3.0)]
+    ).double()
+    x = torch.rand((200, 2), dtype=torch.float64)
+    # identity flow, so the density is given by the mapping
+    expected = torch.cat(
+        [
+            1 / (2 * x[:100].sqrt()).prod(dim=1),
+            1 / (3 * x[100:] ** (2 / 3)).prod(dim=1),
+        ]
+    )
+    channels = torch.arange(2).repeat_interleave(100)
+    with torch.no_grad():
+        torch.testing.assert_close(flow.prob(x, channel=[100, 100]), expected)
+        torch.testing.assert_close(flow.prob(x), expected)
+        torch.testing.assert_close(flow.prob(x, channel=channels), expected)
+        torch.testing.assert_close(flow.prob(x[100:], channel=1), expected[100:])
+        samples, prob = flow.sample(
+            1000,
+            channel=torch.randint(2, (1000,)),
+            return_prob=True,
+            dtype=torch.float64,
+        )
+    assert ((samples >= 0) & (samples <= 1)).all()
+
+
+def test_distribution_protocol_defaults():
+    """log_prob and prob can be derived from each other"""
+    from madnis.nn import Distribution
+
+    class Uniform(Distribution):
+        def prob(self, x, c=None, channel=None):
+            return torch.ones(len(x), dtype=x.dtype)
+
+    x = torch.rand((5, 2), dtype=torch.float64)
+    torch.testing.assert_close(
+        Uniform().log_prob(x), torch.zeros(5, dtype=torch.float64)
+    )
+
+
+def test_one_dimensional_flow_ignores_condition_masks():
+    """in one dimension, the input is transformed without condition in every block"""
+    flow = Flow(dims_in=1, condition_masks=torch.ones((2, 3), dtype=torch.bool))
+    assert flow.condition_masks.tolist() == [[False]]

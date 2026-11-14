@@ -128,3 +128,12 @@ def test_stratified_variance_multichannel():
     torch.testing.assert_close(
         stratified_variance(f, q, q, channels), expected, rtol=1e-6, atol=0
     )
+
+
+@pytest.mark.parametrize("loss", [stratified_variance, stratified_variance_softclip])
+def test_stratified_losses_default_sampling_probability(loss):
+    """without q_sample, the samples are assumed to follow q_test"""
+    f, q = samples()
+    channels = torch.arange(len(f)) % 2
+    torch.testing.assert_close(loss(f, q), loss(f, q, q))
+    torch.testing.assert_close(loss(f, q, None, channels), loss(f, q, q, channels))

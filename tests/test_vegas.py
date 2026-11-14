@@ -97,3 +97,84 @@ def test_vegas_sample_weights_with_grouping(grouping_mode):
     vegas.train([5000] * 3)
     assert_compatible(*vegas.integrate(100000), TWO_PEAKS_INTEGRAL)
     assert_weights_unbiased(vegas.sample(100000).weights, TWO_PEAKS_INTEGRAL)
+
+
+def test_vegas_with_discrete_dimension_last():
+    def function(x):
+        return (1 + x[:, 1]) * torch.exp(-((x[:, 0] - 0.5) ** 2) / (2 * SIGMA**2))
+
+    torch.manual_seed(0)
+    integrand = Integrand(
+        function, input_dim=2, discrete_dims=[3], discrete_dims_position="last"
+    )
+    integrator = Integrator(integrand, batch_size=512, dtype=torch.float64)
+    vegas = VegasPreTraining(integrator)
+    vegas.train([5000] * 5)
+    expected = (1 + 2 + 3) * gauss_1d_integral(0.5)
+    assert_compatible(*vegas.integrate(100000), expected)
+    vegas.initialize_integrator()
+    assert_compatible(*integrator.integrate(100000), expected)
+
+
+@pytest.mark.parametrize("grouping_mode", ["none", "uniform"])
+def test_vegas_with_dropped_zeros_multichannel(grouping_mode):
+    from madnis.integrator import ChannelGrouping
+
+    from .integrands import cut_function_multichannel, reference_integral
+
+    torch.manual_seed(0)
+    integrand = Integrand(
+        cut_function_multichannel,
+        input_dim=2,
+        channel_count=2,
+        has_channel_weight_prior=True,
+        channel_grouping=(
+            ChannelGrouping([None, 0]) if grouping_mode == "uniform" else None
+        ),
+    )
+    integrator = Integrator(
+        integrand,
+        batch_size=512,
+        drop_zero_integrands=True,
+        buffer_capacity=50000,
+        channel_grouping_mode=grouping_mode,
+        dtype=torch.float64,
+    )
+    vegas = VegasPreTraining(integrator)
+    vegas.train([5000] * 4)
+    assert integrator.buffer.size > 0
+    assert_compatible(*vegas.integrate(100000), reference_integral())
+    assert_compatible(*integrator.integral(), reference_integral())
+
+
+def test_vegas_training_callback_and_interrupt():
+    import os
+    import signal
+
+    def callback(status):
+        statuses.append(status)
+        if len(statuses) == 2:
+            os.kill(os.getpid(), signal.SIGINT)
+
+    statuses = []
+    integrator = make_integrator(False)
+    vegas = VegasPreTraining(integrator)
+    old_handler = signal.getsignal(signal.SIGINT)
+    vegas.train([1000] * 5, callback=callback, capture_keyboard_interrupt=True)
+    assert len(statuses) == 2
+    assert signal.getsignal(signal.SIGINT) is old_handler
+
+
+def test_vegas_sampling_options():
+    integrator = make_integrator(True)
+    vegas = VegasPreTraining(integrator)
+    vegas.train([2000] * 3)
+    assert (vegas.sample(1000, channel=1).channels == 1).all()
+    assert_weights_unbiased(
+        vegas.sample(100000, channel_weight_mode="uniform").weights, TWO_PEAKS_INTEGRAL
+    )
+    samples = vegas.sample(100, evaluate_integrand=False)
+    assert (samples.func_vals == 0).all()
+    total, per_channel = vegas.unweighting_metrics(20000)
+    assert len(per_channel) == 2
+    assert 0 < total.uweff_after_cuts_partial <= 1

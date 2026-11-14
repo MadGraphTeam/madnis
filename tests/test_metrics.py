@@ -125,3 +125,17 @@ def test_unweighting_metrics_multichannel():
     assert total.uweff_before_cuts_partial == pytest.approx(1.0 / 1.6)
     assert total.cut_eff == pytest.approx(1.0 / 1.6)
     assert total.uweff_after_cuts_partial == pytest.approx(1.0)
+
+
+def test_unweighting_metrics_without_events():
+    """channels without events passing the cuts do not contribute"""
+    assert truncated_max_weight(torch.zeros(10)) == 0.0
+    metrics = unweighting_metrics(torch.zeros(100))
+    assert metrics.cut_eff == 0.0
+    assert metrics.uweff_before_cuts == 0.0
+    channels = torch.arange(1000) % 2
+    weights = torch.where(channels == 0, 1.0, 0.0).double()
+    total, per_channel = unweighting_metrics(weights, channels, 2)
+    assert per_channel[1].cut_eff == 0.0
+    assert total.uweff_after_cuts_partial == pytest.approx(1.0)
+    assert total.cut_eff == pytest.approx(1.0)
