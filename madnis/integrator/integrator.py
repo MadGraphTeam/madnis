@@ -1051,8 +1051,11 @@ class Integrator(nn.Module):
             channel_weight_mode: specifies whether the channels are weighted by their mean or
                 variance. Note that weighting by mean can lead to problems for non-positive functions
             channel: if different from None, samples are only generated for this channel
-            evaluate_integrand: If False, the integrand is not evaluated and weight, y and alphas_prior are set to dummy values. This can be used when integrand
-                is expensive and one only needs the flow prob.
+            evaluate_integrand: If False, the integrand is not evaluated. If the integrand has
+                a ``channel_weight_function``, it is used to compute the remapped points and
+                prior channel weights, and the integrand values are set to one. Otherwise, the
+                integrand values, remapped points and prior channel weights are set to zero or
+                None. In both cases, the weights of the samples are not integration weights.
         Returns:
             Object containing a batch of samples
         """
@@ -1112,13 +1115,25 @@ class Integrator(nn.Module):
                 if evaluate_integrand:
                     weight, y, alphas_prior = self.integrand(x, channels)
                     self._check_integrand_output(x, weight, alphas_prior)
-                    if valid_channels is not None:
-                        weight = torch.where(
-                            valid_channels, weight, torch.zeros_like(weight)
-                        )
-                else:
-                    weight, y, alphas_prior = self.integrand.function_dummy(x, channels)
+                elif self.integrand.channel_weight_function is not None:
+                    # Only the remapped points and the prior channel weights are computed.
+                    # The integrand values are set to one, because the channel weight network
+                    # is only applied to points with non-zero integrand.
+                    _, y, alphas_prior = self.integrand.channel_weight_function(
+                        x, channels
+                    )
                     weight = torch.ones((x.shape[0]), device=x.device, dtype=x.dtype)
+                    self._check_integrand_output(
+                        x, torch.zeros_like(weight), alphas_prior
+                    )
+                else:
+                    weight = torch.zeros((x.shape[0]), device=x.device, dtype=x.dtype)
+                    y = None
+                    alphas_prior = None
+                if valid_channels is not None:
+                    weight = torch.where(
+                        valid_channels, weight, torch.zeros_like(weight)
+                    )
 
             if weight_factor is not None:
                 weight *= weight_factor
@@ -1366,6 +1381,11 @@ class Integrator(nn.Module):
                 variance or uniformly. Note that weighting by mean can lead to problems for
                 non-positive functions
             channel: if different from None, samples are only generated for this channel
+            evaluate_integrand: If False, the integrand is not evaluated. If the integrand has
+                a ``channel_weight_function``, it is used to compute the remapped points and
+                prior channel weights, and the integrand values are set to one. Otherwise, the
+                integrand values, remapped points and prior channel weights are set to zero or
+                None. In both cases, the weights of the samples are not integration weights.
         Returns:
             ``SampleBatch`` object, see its documentation for details
         """

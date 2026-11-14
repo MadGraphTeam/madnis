@@ -29,7 +29,7 @@ class Integrand(nn.Module):
         discrete_prior_prob_function: (
             Callable[[torch.Tensor, int], torch.Tensor] | None
         ) = None,
-        function_dummy: Callable | None = None,
+        channel_weight_function: Callable | None = None,
     ):
         """
         Args:
@@ -65,6 +65,11 @@ class Integrand(nn.Module):
                 with a channel-dependent mapping computed as part of the integrand function.
             has_channel_weight_prior: If True, the integrand returns channel weights
             channel_grouping: ChannelGrouping object or None if all channels are independent
+            channel_weight_function: Optional function with the same signature as ``function``
+                that only computes the remapped point and the prior channel weights, without
+                the expensive integrand. It is used to sample points with their channel weights
+                when ``evaluate_integrand=False`` is passed to ``Integrator.sample``. The
+                integrand values it returns are ignored.
         """
         # TODO: update documentation
         super().__init__()
@@ -80,44 +85,28 @@ class Integrand(nn.Module):
         self.discrete_dims = discrete_dims
         self.discrete_dims_position = discrete_dims_position
         self.discrete_prior_prob_function = discrete_prior_prob_function
-        self.function_dummy = function_dummy
-        if function_includes_sampling:
-            self.function = function
-        elif channel_count is None:
-            self.function = lambda x, channels: (function(x), None, None)
-        elif remapped_dim is None:
-            if has_channel_weight_prior:
-
-                def func(x, channels):
-                    w, prior = function(x, channels)
-                    return w, None, prior
-
-                self.function = func
-            else:
-                self.function = lambda x, channels: (function(x, channels), None, None)
-
-        elif has_channel_weight_prior:
-            self.function = function
-        else:
-
-            def func(x, channels):
-                w, y = function(x, channels)
-                return w, y, None
-
-            self.function = func
-
         if bounds is not None:
             bounds = torch.tensor(bounds)
             self.register_buffer("scale", bounds[:, 1] - bounds[:, 0])
             self.register_buffer("offset", bounds[:, 0])
             self.register_buffer("scale_det", self.scale.prod())
-            old_func = self.function
+        else:
+            self.scale = None
 
-            def rescaled_func(x, channels):
-                w, y, prior = old_func(self.scale * x + self.offset, channels)
-                return self.scale_det * w, y, prior
-
-            self.function = rescaled_func
+        if function_includes_sampling:
+            if channel_weight_function is not None:
+                raise ValueError(
+                    "channel_weight_function is not supported for integrands that include "
+                    "the sampling"
+                )
+            self.function = function
+        else:
+            self.function = self._wrap_function(function)
+        self.channel_weight_function = (
+            None
+            if channel_weight_function is None
+            else self._wrap_function(channel_weight_function)
+        )
 
         self.register_buffer(
             "channel_id_map",
@@ -132,6 +121,52 @@ class Integrand(nn.Module):
                 )
             ),
         )
+
+    def _wrap_function(self, function: Callable) -> Callable:
+        """
+        Wraps a function with one of the signatures described in the constructor, such that it
+        returns the integrand value, the remapped point and the prior channel weights, and maps
+        the integration domain given by the bounds onto the unit hypercube.
+
+        Args:
+            function: integrand function
+        Returns:
+            function with signature ``(x, c) -> (f, y, alpha)``, where ``y`` and ``alpha`` can
+            be None
+        """
+        if self.channel_count is None:
+
+            def wrapped(x, channels):
+                return function(x), None, None
+
+        elif not self.has_remapped_dim:
+            if self.has_channel_weight_prior:
+
+                def wrapped(x, channels):
+                    w, prior = function(x, channels)
+                    return w, None, prior
+
+            else:
+
+                def wrapped(x, channels):
+                    return function(x, channels), None, None
+
+        elif self.has_channel_weight_prior:
+            wrapped = function
+        else:
+
+            def wrapped(x, channels):
+                w, y = function(x, channels)
+                return w, y, None
+
+        if self.scale is None:
+            return wrapped
+
+        def rescaled(x, channels):
+            w, y, prior = wrapped(self.scale * x + self.offset, channels)
+            return self.scale_det * w, y, prior
+
+        return rescaled
 
     def unique_channel_count(self) -> int:
         """
