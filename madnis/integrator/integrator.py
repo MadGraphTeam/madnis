@@ -515,8 +515,59 @@ class Integrator(nn.Module):
         mask = samples.func_vals != 0
         y = self._cwnet_input(samples)
         alpha[mask] *= self.cwnet(y[mask]).exp()
-        ret = alpha / alpha.sum(dim=1, keepdim=True)
-        return ret
+        # At points where all channel weights vanish, the integrand is zero (this is checked
+        # when the integrand is called), so the channel weights can be set to zero there.
+        alpha_sum = alpha.sum(dim=1, keepdim=True)
+        return alpha / torch.where(alpha_sum > 0, alpha_sum, torch.ones_like(alpha_sum))
+
+    def _check_integrand_output(
+        self,
+        x: torch.Tensor,
+        func_vals: torch.Tensor,
+        alphas_prior: torch.Tensor | None,
+    ):
+        """
+        Checks the values returned by the integrand and raises an exception for values that
+        cannot be integrated: non-finite integrand values, negative or non-finite prior channel
+        weights, and prior channel weights that are all zero at points with non-zero integrand.
+        Like in MadGraph7, the integration is aborted in these cases, because they cannot be
+        recovered from by sampling further and ignoring them would bias the result.
+
+        Args:
+            x: sampled points, shape (n, input_dim)
+            func_vals: integrand values, shape (n, )
+            alphas_prior: prior channel weights, shape (n, channels), or None
+        """
+        n = len(func_vals)
+        non_finite = ~torch.isfinite(func_vals)
+        if non_finite.any():
+            raise ValueError(
+                f"The integrand returned {non_finite.sum().item()} non-finite values (nan or "
+                f"inf) for {n} points, for example at x = {x[non_finite][0].tolist()}. A "
+                "non-finite value cannot be integrated, so MadNIS stops here. This usually "
+                "means that the integrand or the phase-space mapping is not defined at some "
+                "points, for example at a threshold or for a zero or negative width."
+            )
+        if alphas_prior is None:
+            return
+        invalid = ~torch.isfinite(alphas_prior) | (alphas_prior < 0)
+        if invalid.any():
+            invalid_points = invalid.any(dim=1)
+            raise ValueError(
+                f"The integrand returned negative or non-finite prior channel weights for "
+                f"{invalid_points.sum().item()} of {n} points, for example "
+                f"{alphas_prior[invalid_points][0].tolist()} at x = "
+                f"{x[invalid_points][0].tolist()}. Prior channel weights have to be "
+                "non-negative and finite."
+            )
+        all_zero = (alphas_prior.sum(dim=1) == 0) & (func_vals != 0)
+        if all_zero.any():
+            raise ValueError(
+                f"The prior channel weights are all zero for {all_zero.sum().item()} of {n} "
+                f"points with non-zero integrand, for example at x = "
+                f"{x[all_zero][0].tolist()}. At least one channel needs a positive prior "
+                "weight wherever the integrand is non-zero."
+            )
 
     def _cwnet_input(self, samples: SampleBatch) -> torch.Tensor:
         """
@@ -1028,6 +1079,7 @@ class Integrator(nn.Module):
                 x, prob, weight, y, alphas_prior, channels = self.integrand.function(
                     batch_channels
                 )
+                self._check_integrand_output(x, weight, alphas_prior)
             else:
                 if self.group_channels and self.group_channels_uniform:
                     group_sizes = self.channel_group_sizes[batch_channels]
@@ -1059,6 +1111,7 @@ class Integrator(nn.Module):
                     )
                 if evaluate_integrand:
                     weight, y, alphas_prior = self.integrand(x, channels)
+                    self._check_integrand_output(x, weight, alphas_prior)
                     if valid_channels is not None:
                         weight = torch.where(
                             valid_channels, weight, torch.zeros_like(weight)

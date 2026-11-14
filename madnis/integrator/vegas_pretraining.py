@@ -141,6 +141,7 @@ class VegasPreTraining:
                 channels = None
 
             func_vals, y, alphas = self.integrand(x_torch, channels)
+            self.integrator._check_integrand_output(x_torch, func_vals, alphas)
             if valid_channels is not None:
                 func_vals = torch.where(
                     valid_channels, func_vals, torch.zeros_like(func_vals)
@@ -387,6 +388,7 @@ class VegasPreTraining:
 
             if evaluate_integrand:
                 func_vals, y, alphas = self.integrand(x_torch, channels)
+                self.integrator._check_integrand_output(x_torch, func_vals, alphas)
                 if valid_channels is not None:
                     func_vals = torch.where(
                         valid_channels, func_vals, torch.zeros_like(func_vals)
