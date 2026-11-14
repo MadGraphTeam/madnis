@@ -70,6 +70,7 @@ class Integrand(nn.Module):
         super().__init__()
         self.input_dim = input_dim
         self.remapped_dim = input_dim if remapped_dim is None else remapped_dim
+        self.has_remapped_dim = remapped_dim is not None
         self.channel_count = channel_count
         self.has_channel_weight_prior = has_channel_weight_prior
         self.channel_grouping = channel_grouping
@@ -161,6 +162,9 @@ class Integrand(nn.Module):
 
     def update_active_channels_mask(self, mask: torch.Tensor) -> None:
         if self.update_active_channels_mask_func is None:
+            return
+        if self.channel_grouping is None:
+            self.update_active_channels_mask_func(mask)
             return
 
         full_mask = mask[

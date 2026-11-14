@@ -20,6 +20,7 @@ from .metrics import (
     IntegrationMetrics,
     UnweightingMetrics,
     integration_metrics,
+    truncated_max_weight,
     unweighting_metrics,
 )
 from .vegas_pretraining import VegasPreTraining
@@ -42,6 +43,7 @@ __all__ = [
     "ChannelGrouping",
     "UnweightingMetrics",
     "unweighting_metrics",
+    "truncated_max_weight",
     "IntegrationMetrics",
     "integration_metrics",
     "VegasPreTraining",

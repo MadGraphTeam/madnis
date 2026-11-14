@@ -123,11 +123,15 @@ class VegasPreTraining:
             x_torch = torch.as_tensor(x, dtype=self.integrator.dummy.dtype)
             x_torch, jac = self._map_discrete(x_torch, jac)
 
+            valid_channels = None
             if (
                 self.integrator.group_channels
                 and not self.integrator.group_channels_uniform
             ):
-                channels = torch.full((samples_per_channel,), grid_index)
+                # the channel within the group is given by a discrete dimension
+                channels, valid_channels = self.integrator._learned_group_channels(
+                    x_torch, torch.full((samples_per_channel,), grid_index)
+                )
             elif self.integrator.multichannel:
                 # TODO: no need for random numbers here
                 channels = torch.from_numpy(
@@ -137,20 +141,11 @@ class VegasPreTraining:
                 channels = None
 
             func_vals, y, alphas = self.integrand(x_torch, channels)
-            if (
-                self.integrator.group_channels
-                and not self.integrator.group_channels_uniform
-            ):
-                if not self.integrator.group_channels_cdf_mode:
-                    raise NotImplementedError(
-                        "discrete sampling in index mode not supported in VEGAS"
-                    )
-                chan_in_group = (
-                    x_torch[:, self.integrator.channel_group_dim] * len(grid_channels)
-                ).long()
-                channels = self.integrator.channel_group_remap[
-                    grid_index, chan_in_group
-                ]
+            self.integrator._check_integrand_output(x_torch, func_vals, alphas)
+            if valid_channels is not None:
+                func_vals = torch.where(
+                    valid_channels, func_vals, torch.zeros_like(func_vals)
+                )
 
             if self.integrator.multichannel:
                 alpha = torch.gather(alphas, index=channels[:, None], dim=1)[:, 0]
@@ -216,18 +211,22 @@ class VegasPreTraining:
                         f_chan - means[chan]
                     ).square().sum() / counts_chan
 
-            self.integrator._store_samples(
-                SampleBatch(
-                    x_torch,
-                    y,
-                    torch.from_numpy(1 / jac),
-                    func_vals,
-                    channels,
-                    alphas,
-                    integration_channels=integration_channels,
-                    zero_counts=zero_counts,
-                ).map(lambda t: t.to(self.integrator.dummy.device))
-            )
+            stored_samples = SampleBatch(
+                x_torch,
+                y,
+                torch.from_numpy(1 / jac),
+                func_vals,
+                channels,
+                alphas,
+                integration_channels=integration_channels,
+            ).map(lambda t: t.to(self.integrator.dummy.device))
+            if zero_counts is not None:
+                # same rescaling of the sampling probabilities as for the online samples
+                stored_samples.zero_counts = zero_counts.to(
+                    self.integrator.dummy.device
+                )
+                stored_samples = self.integrator._rescale_dropped(stored_samples)
+            self.integrator._store_samples(stored_samples)
         self.integrator.integration_history.store(
             means[None], variances[None], counts[None]
         )
@@ -362,7 +361,17 @@ class VegasPreTraining:
             x_torch = torch.as_tensor(x, dtype=self.integrator.dummy.dtype)
             x_torch, jac = self._map_discrete(x_torch, jac)
             integration_channels = None
-            if self.integrator.group_channels:
+            valid_channels = None
+            if (
+                self.integrator.group_channels
+                and not self.integrator.group_channels_uniform
+            ):
+                # the channel within the group is given by a discrete dimension
+                integration_channels = torch.full((n_samples,), grid_index)
+                channels, valid_channels = self.integrator._learned_group_channels(
+                    x_torch, integration_channels
+                )
+            elif self.integrator.group_channels:
                 channels = torch.from_numpy(
                     self.rng.choice(grid_channels, (n_samples,))
                 )
@@ -378,34 +387,16 @@ class VegasPreTraining:
                 channels = None
 
             if evaluate_integrand:
-                func_vals, y, alphas = self.integrand(
-                    x_torch,
-                    (
-                        channels
-                        if not self.integrator.group_channels
-                        or self.integrator.group_channels_uniform
-                        else integration_channels
-                    ),
-                )
+                func_vals, y, alphas = self.integrand(x_torch, channels)
+                self.integrator._check_integrand_output(x_torch, func_vals, alphas)
+                if valid_channels is not None:
+                    func_vals = torch.where(
+                        valid_channels, func_vals, torch.zeros_like(func_vals)
+                    )
             else:
                 func_vals = torch.zeros((x.shape[0]), dtype=self.integrator.dummy.dtype)
                 y = torch.zeros_like(x_torch)
                 alphas = torch.zeros_like(x_torch)
-
-            if (
-                self.integrator.group_channels
-                and not self.integrator.group_channels_uniform
-            ):
-                if not self.integrator.group_channels_cdf_mode:
-                    raise NotImplementedError(
-                        "discrete sampling in index mode not supported in VEGAS"
-                    )
-                chan_in_group = (
-                    x_torch[:, self.integrator.channel_group_dim] * len(grid_channels)
-                ).long()
-                channels = self.integrator.channel_group_remap[
-                    grid_index, chan_in_group
-                ]
 
             # TODO: assign channels if importance-sampled
             if (
@@ -437,11 +428,12 @@ class VegasPreTraining:
             )
         cat_samples = SampleBatch.cat(samples)
         if self.integrator.multichannel:
-            norm_factors = len(cat_samples.channels) / torch.bincount(
-                cat_samples.channels,
-                minlength=self.integrator.integration_channel_count,
+            # the samples are generated per integration channel (channel group)
+            channels = self.integrator._batch_channels(cat_samples)
+            norm_factors = len(channels) / torch.bincount(
+                channels, minlength=self.integrator.integration_channel_count
             )
-            cat_samples.weights *= norm_factors[cat_samples.channels]
+            cat_samples.weights *= norm_factors[channels]
         return cat_samples
 
     def _compute_integral(
@@ -521,7 +513,8 @@ class VegasPreTraining:
         n: int,
         batch_size: int = 100000,
         channel_weight_mode: Literal["uniform", "mean", "variance"] = "mean",
-    ) -> UnweightingMetrics:
+        max_overweight_truncation: float = 0.01,
+    ) -> UnweightingMetrics | tuple[UnweightingMetrics, list[UnweightingMetrics]]:
         """
         Draws samples and computes metrics for the total and channel-wise integration quality.
         This function is only suitable for functions that are non-negative everywhere.
@@ -531,10 +524,17 @@ class VegasPreTraining:
             batch_size: batch size used for sampling and calling the integrand
             channel_weight_mode: specifies whether the channels are weighted by their mean,
                 variance or uniformly.
+            max_overweight_truncation: tolerated fraction of over-weight events, used to
+                determine the maximum weight as in MadGraph7
         Returns:
-            ``UnweightingMetrics`` object, see its documentation for details
+            ``UnweightingMetrics`` object, see its documentation for details. In the
+            multi-channel case, a list of channel-wise ``UnweightingMetrics`` is returned in
+            addition.
         """
         samples = self.sample(n, batch_size, channel_weight_mode)
         return unweighting_metrics(
-            samples.weights, samples.channels, self.integrand.channel_count
+            samples.weights,
+            samples.channels,
+            self.integrand.channel_count,
+            max_overweight_truncation,
         )

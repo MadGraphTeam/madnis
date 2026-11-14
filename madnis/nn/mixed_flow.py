@@ -46,15 +46,15 @@ class MixedFlow(nn.Module, Distribution):
                 **discrete_kwargs,
             )
         elif discrete_model == "transformer":
+            if channels is not None:
+                raise NotImplementedError(
+                    "DiscreteTransformer only supported for single-channel integration"
+                )
             self.discrete_flow = DiscreteTransformer(
                 dims_in=dims_in_discrete,
                 dims_c=dims_c_discrete,
                 **discrete_kwargs,
             )
-            if channels is not None:
-                raise NotImplementedError(
-                    "DiscreteTransformer only supported for single-channel integration"
-                )
         else:
             raise ValueError("discrete_model must be 'made' or 'transformer'")
 

@@ -180,6 +180,8 @@ class Integrator(nn.Module):
         freeze_cwnet_iteration: int | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        rescale_dropped_zeros: bool = True,
+        buffer_unweighting_quantile: float | None = None,
     ):
         """
         Args:
@@ -220,7 +222,7 @@ class Integrator(nn.Module):
                 variances are stored. This is used for stratified sampling during integration, and
                 during the training if uniform_channel_ratio is different from one.
             drop_zero_integrands: If True, points with integrand zero are dropped and not used for
-                the optimization.
+                the optimization. See also ``rescale_dropped_zeros``.
             batch_size_threshold: New samples are drawn until the number of samples is at least
                 batch_size_threshold * batch_size.
             buffer_capacity: number of samples that are stored for buffered training
@@ -242,6 +244,19 @@ class Integrator(nn.Module):
                 channel weight network is frozen
             device: torch device used for training and integration. If None, use default device.
             dtype: torch dtype used for training and integration. If None, use default dtype.
+            rescale_dropped_zeros: Only relevant if drop_zero_integrands is True. If True, the
+                sampling probabilities of the kept samples are multiplied by the channel-wise
+                ratio of generated to kept samples, as done by ``drop_cuts_and_rescale`` in
+                MadGraph7. Then all estimates computed from the kept samples are unbiased, in
+                particular the channel-wise means and variances entering the loss and the
+                buffered samples. If False, the kept samples are used with their original
+                sampling probabilities.
+            buffer_unweighting_quantile: If not None, the samples are partially unweighted before
+                they are stored in the buffer, as done by the ``BufferUnweighter`` in MadGraph7.
+                In every channel, the given quantile of the absolute non-zero weights is used as
+                maximum weight. The sampling probabilities of the stored samples are multiplied by
+                their acceptance probability and the channel-wise ratio of total to accepted
+                samples, such that buffered training remains unbiased. MadGraph7 uses 0.95.
         """
         super().__init__()
 
@@ -263,14 +278,23 @@ class Integrator(nn.Module):
             self.integration_channel_count = integrand.unique_channel_count()
             self.group_channels = True
             self.group_channels_uniform = False
+            # The index of the channel within its group is sampled as the first discrete
+            # dimension, which has to be provided by the integrand
             self.channel_group_dim = (
                 0
                 if integrand.discrete_dims_position == "first"
                 else input_dim - len(discrete_dims)
             )
-            # TODO: provide default implementation of discrete prior
-            # discrete_dims.insert(0, max(len(group.channel_indices) for group in integrand.channel_grouping.groups))
-            # input_dim += 1
+            max_group_size = max(
+                len(group.channel_indices)
+                for group in integrand.channel_grouping.groups
+            )
+            if len(discrete_dims) == 0 or discrete_dims[0] < max_group_size:
+                raise ValueError(
+                    "channel_grouping_mode='learned' requires that the first discrete "
+                    "dimension of the integrand encodes the index of the channel within its "
+                    f"group, with at least {max_group_size} options"
+                )
         else:
             raise ValueError(f"Unknown channel grouping mode {channel_grouping_mode}")
 
@@ -351,7 +375,12 @@ class Integrator(nn.Module):
                 )
 
         if cwnet is None and train_channel_weights and self.multichannel:
-            cwnet = MLP(integrand.remapped_dim, integrand.channel_count, **cwnet_kwargs)
+            cwnet_dim = integrand.remapped_dim
+            if self.group_channels and not self.group_channels_uniform:
+                if not integrand.has_remapped_dim:
+                    # the index of the channel within its group is not an input
+                    cwnet_dim -= 1
+            cwnet = MLP(cwnet_dim, integrand.channel_count, **cwnet_kwargs)
         if cwnet is None:
             parameters = flow.parameters()
         else:
@@ -376,6 +405,7 @@ class Integrator(nn.Module):
         )
         self.uniform_channel_ratio = uniform_channel_ratio
         self.drop_zero_integrands = drop_zero_integrands
+        self.rescale_dropped_zeros = rescale_dropped_zeros
         self.batch_size_threshold = batch_size_threshold
         if loss is None:
             self.loss = stratified_variance if self.multichannel else kl_divergence
@@ -383,6 +413,7 @@ class Integrator(nn.Module):
             self.loss = loss
 
         self.minimum_buffer_size = minimum_buffer_size
+        self.buffer_unweighting_quantile = buffer_unweighting_quantile
         self.buffered_steps = buffered_steps
         self.max_stored_channel_weights = (
             None
@@ -482,10 +513,107 @@ class Integrator(nn.Module):
 
         alpha = alpha_prior * active_channels_mask
         mask = samples.func_vals != 0
-        y = samples.x if samples.y is None else samples.y
+        y = self._cwnet_input(samples)
         alpha[mask] *= self.cwnet(y[mask]).exp()
-        ret = alpha / alpha.sum(dim=1, keepdim=True)
-        return ret
+        # At points where all channel weights vanish, the integrand is zero (this is checked
+        # when the integrand is called), so the channel weights can be set to zero there.
+        alpha_sum = alpha.sum(dim=1, keepdim=True)
+        return alpha / torch.where(alpha_sum > 0, alpha_sum, torch.ones_like(alpha_sum))
+
+    def _check_integrand_output(
+        self,
+        x: torch.Tensor,
+        func_vals: torch.Tensor,
+        alphas_prior: torch.Tensor | None,
+    ):
+        """
+        Checks the values returned by the integrand and raises an exception for values that
+        cannot be integrated: non-finite integrand values, negative or non-finite prior channel
+        weights, and prior channel weights that are all zero at points with non-zero integrand.
+        Like in MadGraph7, the integration is aborted in these cases, because they cannot be
+        recovered from by sampling further and ignoring them would bias the result.
+
+        Args:
+            x: sampled points, shape (n, input_dim)
+            func_vals: integrand values, shape (n, )
+            alphas_prior: prior channel weights, shape (n, channels), or None
+        """
+        n = len(func_vals)
+        non_finite = ~torch.isfinite(func_vals)
+        if non_finite.any():
+            raise ValueError(
+                f"The integrand returned {non_finite.sum().item()} non-finite values (nan or "
+                f"inf) for {n} points, for example at x = {x[non_finite][0].tolist()}. A "
+                "non-finite value cannot be integrated, so MadNIS stops here. This usually "
+                "means that the integrand or the phase-space mapping is not defined at some "
+                "points, for example at a threshold or for a zero or negative width."
+            )
+        if alphas_prior is None:
+            return
+        invalid = ~torch.isfinite(alphas_prior) | (alphas_prior < 0)
+        if invalid.any():
+            invalid_points = invalid.any(dim=1)
+            raise ValueError(
+                f"The integrand returned negative or non-finite prior channel weights for "
+                f"{invalid_points.sum().item()} of {n} points, for example "
+                f"{alphas_prior[invalid_points][0].tolist()} at x = "
+                f"{x[invalid_points][0].tolist()}. Prior channel weights have to be "
+                "non-negative and finite."
+            )
+        all_zero = (alphas_prior.sum(dim=1) == 0) & (func_vals != 0)
+        if all_zero.any():
+            raise ValueError(
+                f"The prior channel weights are all zero for {all_zero.sum().item()} of {n} "
+                f"points with non-zero integrand, for example at x = "
+                f"{x[all_zero][0].tolist()}. At least one channel needs a positive prior "
+                "weight wherever the integrand is non-zero."
+            )
+
+    def _cwnet_input(self, samples: SampleBatch) -> torch.Tensor:
+        """
+        Returns the input of the channel weight network. This is the remapped point y if the
+        integrand provides it, and otherwise the sampled point x. For learned channel grouping,
+        the index of the channel within its group is removed from x, because it labels the
+        channel and is not a coordinate of the integration space. Otherwise, the channel weights
+        would not be normalized at a fixed point of the integration space, and the integral
+        would be biased.
+
+        Args:
+            samples: batch of samples
+        Returns:
+            input of the channel weight network, shape (n, cwnet input dimension)
+        """
+        if samples.y is not None:
+            return samples.y
+        if self.group_channels and not self.group_channels_uniform:
+            keep = torch.arange(samples.x.shape[1], device=samples.x.device)
+            return samples.x[:, keep != self.channel_group_dim]
+        return samples.x
+
+    def _learned_group_channels(
+        self, x: torch.Tensor, groups: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Determines the channel indices for learned channel grouping, where the index of the
+        channel within its group is sampled as a discrete dimension. If a group is smaller than
+        the number of options of that dimension, the larger indices do not correspond to a
+        channel. These samples are mapped onto the last channel of the group and have to be
+        assigned zero weight.
+
+        Args:
+            x: sampled points, shape (n, input_dim)
+            groups: channel group indices, shape (n, )
+        Returns:
+            A tuple containing
+
+              - channel indices, shape (n, )
+              - mask of the samples with a valid index within the group, shape (n, )
+        """
+        chan_in_group = x[:, self.channel_group_dim].long()
+        group_sizes = self.channel_group_sizes[groups]
+        valid = chan_in_group < group_sizes
+        chan_in_group = torch.minimum(chan_in_group, group_sizes - 1)
+        return self.channel_group_remap[groups, chan_in_group], valid
 
     def _compute_integral(
         self, samples: SampleBatch
@@ -508,34 +636,33 @@ class Integrator(nn.Module):
                 self._get_alphas(samples), index=samples.channels[:, None], dim=1
             )[:, 0]
             f_true = alphas * samples.func_vals
-            f_div_q = f_true.detach() / samples.q_sample
-            channels = (
-                samples.channels
-                if samples.integration_channels is None
-                else samples.integration_channels
-            )
-            counts = torch.bincount(channels, minlength=self.integration_channel_count)
-            if samples.zero_counts is not None:
-                counts += samples.zero_counts
-            means = torch.bincount(
-                channels,
-                weights=f_div_q,
-                minlength=self.integration_channel_count,
-            ) / counts.clip(min=1)
-            variances = (
-                torch.bincount(
-                    channels,
-                    weights=(f_div_q - means[channels]).square(),
-                    minlength=self.integration_channel_count,
-                )
-                / counts
-            )
+            n_channels = self.integration_channel_count
         else:
-            f_div_q = samples.func_vals / samples.q_sample
             f_true = samples.func_vals
-            means = f_div_q.mean(dim=0, keepdim=True)
-            counts = torch.full((1,), f_div_q.shape[0], device=means.device)
-            variances = f_div_q.var(dim=0, keepdim=True)
+            n_channels = 1
+        channels = self._batch_channels(samples)
+        f_div_q = f_true.detach() / samples.q_sample
+        counts = torch.bincount(channels, minlength=n_channels)
+        zero_counts = samples.zero_counts
+        if zero_counts is not None:
+            total_counts = counts + zero_counts
+            if self.rescale_dropped_zeros:
+                # undo the rescaling of q_sample to recover the plain importance weights
+                f_div_q = (
+                    f_div_q
+                    * (total_counts / counts.clip(min=1)).to(f_div_q.dtype)[channels]
+                )
+            counts = total_counts
+        means = torch.bincount(
+            channels, weights=f_div_q, minlength=n_channels
+        ) / counts.clip(min=1)
+        squared_deviations = torch.bincount(
+            channels, weights=(f_div_q - means[channels]).square(), minlength=n_channels
+        )
+        if zero_counts is not None:
+            # every dropped sample has weight zero and contributes mean^2
+            squared_deviations = squared_deviations + zero_counts * means.square()
+        variances = squared_deviations / counts
         return f_true, means, variances, counts
 
     def _optimization_step(
@@ -710,6 +837,11 @@ class Integrator(nn.Module):
         if self.buffer is None:
             return
 
+        if self.buffer_unweighting_quantile is not None:
+            samples = self._unweight_for_buffer(samples)
+            if samples.x.shape[0] == 0:
+                return
+
         if (
             self.max_stored_channel_weights is not None
             and self.integrand.has_channel_weight_prior
@@ -804,6 +936,100 @@ class Integrator(nn.Module):
             ]
         )
 
+    def _unweight_for_buffer(self, samples: SampleBatch) -> SampleBatch:
+        """
+        Partially unweights a batch of samples before it is stored in the buffer, following the
+        ``BufferUnweighter`` of MadGraph7. In every channel, the maximum weight is chosen as the
+        ``buffer_unweighting_quantile`` quantile of the absolute non-zero weights. Samples are
+        accepted with probability ``min(1, |w| / w_max)``. The sampling probability of the
+        accepted samples is multiplied by the acceptance probability and the channel-wise ratio
+        of total to accepted samples. The weights computed from the accepted samples are then
+        unbiased and approximately constant below the maximum weight.
+
+        Args:
+            samples: batch of samples
+        Returns:
+            accepted samples with rescaled sampling probabilities
+        """
+        with torch.no_grad():
+            if self.multichannel:
+                alphas = torch.gather(
+                    self._get_alphas(samples), index=samples.channels[:, None], dim=1
+                )[:, 0]
+                abs_weights = (alphas * samples.func_vals).abs() / samples.q_sample
+            else:
+                abs_weights = samples.func_vals.abs() / samples.q_sample
+            channels = self._batch_channels(samples)
+            n_channels = self.integration_channel_count or 1
+
+            # the quantile is computed from the non-zero weights only, such that it does not
+            # depend on the fraction of zero-integrand samples in the batch
+            nonzero = abs_weights > 0
+            max_weights = torch.zeros(
+                n_channels, device=abs_weights.device, dtype=abs_weights.dtype
+            )
+            for channel in torch.unique(channels[nonzero]).tolist():
+                max_weights[channel] = torch.quantile(
+                    abs_weights[nonzero & (channels == channel)],
+                    self.buffer_unweighting_quantile,
+                )
+            sample_max_weights = max_weights[channels]
+            accept_prob = torch.where(
+                nonzero,
+                abs_weights
+                / sample_max_weights.clip(min=torch.finfo(abs_weights.dtype).tiny),
+                torch.zeros_like(abs_weights),
+            ).clip(max=1.0)
+            accepted = torch.rand_like(accept_prob) < accept_prob
+
+            total_counts = torch.bincount(channels, minlength=n_channels)
+            accepted_counts = torch.bincount(channels[accepted], minlength=n_channels)
+            norm = (total_counts / accepted_counts.clip(min=1)).to(abs_weights.dtype)
+            q_rescaled = samples.q_sample * accept_prob * norm[channels]
+
+        unweighted = samples.map(lambda t: t[accepted])
+        unweighted.q_sample = q_rescaled[accepted]
+        return unweighted
+
+    def _batch_channels(self, samples: SampleBatch) -> torch.Tensor:
+        """
+        Returns the integration channel index of every sample, or zeros in the single-channel
+        case.
+
+        Args:
+            samples: batch of samples
+        Returns:
+            channel indices, shape (n, )
+        """
+        if samples.integration_channels is not None:
+            return samples.integration_channels
+        if samples.channels is not None:
+            return samples.channels
+        return torch.zeros_like(samples.q_sample, dtype=torch.int64)
+
+    def _rescale_dropped(self, samples: SampleBatch) -> SampleBatch:
+        """
+        Multiplies the sampling probabilities of a batch without zero-integrand samples by the
+        channel-wise ratio of generated to kept samples, if ``rescale_dropped_zeros`` is True.
+        This corresponds to ``drop_cuts_and_rescale`` in MadGraph7. The kept samples are then
+        distributed according to the rescaled probabilities, normalized to the region with
+        non-zero integrand, and all Monte Carlo estimates computed from them are unbiased.
+
+        Args:
+            samples: batch of samples with non-zero integrand and zero_counts set
+        Returns:
+            batch with rescaled sampling probabilities
+        """
+        if not self.rescale_dropped_zeros or samples.zero_counts is None:
+            return samples
+        channels = self._batch_channels(samples)
+        kept_counts = torch.bincount(channels, minlength=len(samples.zero_counts))
+        factor = (kept_counts + samples.zero_counts) / kept_counts.clip(min=1)
+        samples.q_sample = (
+            samples.q_sample * factor.to(samples.q_sample.dtype)[channels]
+        )
+        return samples
+
     def _get_samples(
         self,
         n: int,
@@ -853,6 +1079,7 @@ class Integrator(nn.Module):
                 x, prob, weight, y, alphas_prior, channels = self.integrand.function(
                     batch_channels
                 )
+                self._check_integrand_output(x, weight, alphas_prior)
             else:
                 if self.group_channels and self.group_channels_uniform:
                     group_sizes = self.channel_group_sizes[batch_channels]
@@ -876,18 +1103,22 @@ class Integrator(nn.Module):
                         device=self.dummy.device,
                         dtype=self.dummy.dtype,
                     )
+                valid_channels = None
+                if self.group_channels and not self.group_channels_uniform:
+                    integration_channels = batch_channels
+                    channels, valid_channels = self._learned_group_channels(
+                        x, batch_channels
+                    )
                 if evaluate_integrand:
                     weight, y, alphas_prior = self.integrand(x, channels)
+                    self._check_integrand_output(x, weight, alphas_prior)
+                    if valid_channels is not None:
+                        weight = torch.where(
+                            valid_channels, weight, torch.zeros_like(weight)
+                        )
                 else:
                     weight, y, alphas_prior = self.integrand.function_dummy(x, channels)
                     weight = torch.ones((x.shape[0]), device=x.device, dtype=x.dtype)
-
-                if self.group_channels and not self.group_channels_uniform:
-                    chan_in_group = x[:, self.channel_group_dim].long()
-                    integration_channels = batch_channels
-                    channels = self.channel_group_remap[
-                        integration_channels, chan_in_group
-                    ]
 
             if weight_factor is not None:
                 weight *= weight_factor
@@ -930,7 +1161,11 @@ class Integrator(nn.Module):
             if current_batch_size > self.batch_size_threshold * n:
                 break
 
-        return SampleBatch.cat(batches_out)
+        samples = SampleBatch.cat(batches_out)
+        if train and self.drop_zero_integrands:
+            # rescale once for all sampling rounds, such that the rescaling uses the total counts
+            samples = self._rescale_dropped(samples)
+        return samples
 
     def train_step(self) -> TrainingStatus:
         """
@@ -1082,7 +1317,8 @@ class Integrator(nn.Module):
         n: int,
         batch_size: int = 100000,
         channel_weight_mode: Literal["uniform", "mean", "variance"] = "mean",
-    ) -> UnweightingMetrics:
+        max_overweight_truncation: float = 0.01,
+    ) -> UnweightingMetrics | tuple[UnweightingMetrics, list[UnweightingMetrics]]:
         """
         Draws samples and computes metrics for the total and channel-wise integration quality.
         This function is only suitable for functions that are non-negative everywhere.
@@ -1092,8 +1328,12 @@ class Integrator(nn.Module):
             batch_size: batch size used for sampling and calling the integrand
             channel_weight_mode: specifies whether the channels are weighted by their mean,
                 variance or uniformly.
+            max_overweight_truncation: tolerated fraction of over-weight events, used to
+                determine the maximum weight as in MadGraph7
         Returns:
-            ``UnweightingMetrics`` object, see its documentation for details
+            ``UnweightingMetrics`` object, see its documentation for details. In the
+            multi-channel case, a list of channel-wise ``UnweightingMetrics`` is returned in
+            addition.
         """
         samples = self.sample(n, batch_size, channel_weight_mode)
         channels = (
@@ -1102,7 +1342,10 @@ class Integrator(nn.Module):
             else samples.integration_channels
         )
         return unweighting_metrics(
-            samples.weights, channels, self.integration_channel_count
+            samples.weights,
+            channels,
+            self.integration_channel_count,
+            max_overweight_truncation,
         )
 
     def sample(
@@ -1157,8 +1400,11 @@ class Integrator(nn.Module):
             samples.append(batch)
         cat_samples = SampleBatch.cat(samples)
         if self.multichannel:
-            norm_factors = len(cat_samples.channels) / torch.bincount(
-                cat_samples.channels, minlength=self.integration_channel_count
+            # the channels are sampled per integration channel (channel group), so the
+            # weights are normalized with the integration channel counts
+            channels = self._batch_channels(cat_samples)
+            norm_factors = len(channels) / torch.bincount(
+                channels, minlength=self.integration_channel_count
             )
-            cat_samples.weights *= norm_factors[cat_samples.channels]
+            cat_samples.weights *= norm_factors[channels]
         return cat_samples

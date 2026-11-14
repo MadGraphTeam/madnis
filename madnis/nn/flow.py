@@ -295,17 +295,20 @@ class Flow(nn.Module, Distribution):
         if self.mapping is None:
             return x, 0.0
 
-        if isinstance(self.mapping, list):
-            if isinstance(channel, int):
-                mapping = self.mapping[channel]
-                return mapping(x, inverse)
-            else:
-                map_x = []
-                map_jac = []
-                for xc, mapping in zip(x.split(channel, dim=0), self.mapping):
-                    xm, jm = mapping(xc, inverse)
-                    map_x.append(xm)
-                    map_jac.append(jm)
+        if not isinstance(self.mapping, list):
+            return self.mapping(x, inverse)
+
+        if isinstance(channel, int):
+            return self.mapping[channel](x, inverse)
+        if channel is None:
+            channel = [x.shape[0] // len(self.mapping)] * len(self.mapping)
+        map_x = []
+        map_jac = []
+        for xc, mapping in zip(x.split(channel, dim=0), self.mapping):
+            xm, jm = mapping(xc, inverse)
+            map_x.append(xm)
+            map_jac.append(jm)
+        return torch.cat(map_x, dim=0), torch.cat(map_jac, dim=0)
 
     def transform(
         self,
