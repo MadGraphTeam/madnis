@@ -108,6 +108,22 @@ the trainable parameters. For instance, to use the ``SGD`` optimizer instead of 
         optimizer = lambda params: SGD(params, lr=1e-3)
     )
 
+Batches with outlier gradients can destabilize the training. To limit their effect, the gradients
+can be clipped before every optimization step with the ``grad_clip_threshold`` argument, as done in
+MadGraph7. The gradients of all trained parameters are rescaled such that their global norm does not
+exceed ``grad_clip_threshold * sqrt(n)``, where ``n`` is the number of trained parameters. In other
+words, the root mean square of the gradient components is at most ``grad_clip_threshold``.
+MadGraph7 uses
+
+.. code-block:: python
+
+    integrator = Integrator(
+        ..., # other arguments
+        grad_clip_threshold = 0.003
+    )
+
+By default, the gradients are not clipped.
+
 VEGAS pre-training
 ------------------
 
