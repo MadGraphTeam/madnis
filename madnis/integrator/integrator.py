@@ -1,4 +1,5 @@
 import itertools
+import math
 import signal
 import warnings
 from collections.abc import Callable, Iterable
@@ -182,6 +183,7 @@ class Integrator(nn.Module):
         dtype: torch.dtype | None = None,
         rescale_dropped_zeros: bool = True,
         buffer_unweighting_quantile: float | None = None,
+        grad_clip_threshold: float | None = None,
     ):
         """
         Args:
@@ -257,9 +259,17 @@ class Integrator(nn.Module):
                 maximum weight. The sampling probabilities of the stored samples are multiplied by
                 their acceptance probability and the channel-wise ratio of total to accepted
                 samples, such that buffered training remains unbiased. MadGraph7 uses 0.95.
+            grad_clip_threshold: If not None or zero, the gradients are rescaled before every
+                optimization step such that their global norm does not exceed
+                ``grad_clip_threshold * sqrt(n)``, where n is the number of trained parameters.
+                Hence, the root mean square of the gradient components is at most
+                ``grad_clip_threshold``. This is the gradient clipping of MadGraph7, which uses
+                0.003.
         """
         super().__init__()
 
+        if grad_clip_threshold is not None and grad_clip_threshold < 0:
+            raise ValueError("grad_clip_threshold must not be negative")
         if not isinstance(integrand, Integrand):
             integrand = Integrand(integrand, dims)
         self.integrand = integrand
@@ -406,6 +416,7 @@ class Integrator(nn.Module):
         self.uniform_channel_ratio = uniform_channel_ratio
         self.drop_zero_integrands = drop_zero_integrands
         self.rescale_dropped_zeros = rescale_dropped_zeros
+        self.grad_clip_threshold = grad_clip_threshold or None
         self.batch_size_threshold = batch_size_threshold
         if loss is None:
             self.loss = stratified_variance if self.multichannel else kl_divergence
@@ -709,8 +720,31 @@ class Integrator(nn.Module):
             warnings.warn("nan batch: skipping optimization")
         else:
             loss.backward()
+            if self.grad_clip_threshold is not None:
+                self._clip_gradients()
             self.optimizer.step()
         return loss.item(), means, variances, counts
+
+    def _clip_gradients(self) -> torch.Tensor:
+        """
+        Rescales the gradients of all parameters of the optimizer, such that their global norm
+        does not exceed ``grad_clip_threshold * sqrt(n)``, where n is the number of parameters
+        with gradients. Frozen parameters, for example the channel weight network after
+        ``freeze_cwnet_iteration``, do not count.
+
+        Returns:
+            global norm of the gradients before clipping
+        """
+        params = [
+            param
+            for group in self.optimizer.param_groups
+            for param in group["params"]
+            if param.requires_grad and param.grad is not None
+        ]
+        param_count = sum(param.numel() for param in params)
+        return nn.utils.clip_grad_norm_(
+            params, self.grad_clip_threshold * math.sqrt(param_count)
+        )
 
     def _restore_prior(self, samples: SampleBatch) -> torch.Tensor:
         """
