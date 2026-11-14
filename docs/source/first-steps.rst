@@ -228,9 +228,28 @@ We printed the relative standard-deviation to compare the performance with the p
 you can see, they are similar, even though we have reduced the number of calls to our integrand
 function by a factor of four.
 
-The buffer can be filled more efficiently with ``buffer_unweighting_quantile``. Before the samples
-are stored, they are partially unweighted, using the given quantile of the absolute weights in
-every batch as maximum weight. Samples with small weights are mostly discarded, while samples with
-large weights are always kept. The sampling probabilities of the stored samples are rescaled such
-that the buffered training remains unbiased. This is the strategy used by MadGraph7, with a
-quantile of 0.95.
+The buffer can also be filled with partially unweighted samples, as in MadGraph7. This is
+enabled with the argument ``buffer_unweighting_quantile``, for example
+
+.. code-block:: python
+
+    integrator = Integrator(
+        lambda x: (2*x).prod(dim=1),
+        dims=4,
+        buffer_capacity=102400,
+        minimum_buffer_size=4096,
+        buffered_steps=3,
+        buffer_unweighting_quantile=0.95,
+    )
+
+Before a batch is stored, the 95% quantile of its absolute weights is used as maximum weight
+``w_max``, and every sample is accepted with probability ``min(1, |w| / w_max)``. Samples with
+small weights are mostly discarded, while samples with large weights are always kept. The
+sampling probabilities of the stored samples are rescaled with the acceptance probability and
+the inverse acceptance rate, so the buffered training remains unbiased. In the multi-channel
+case, this is done separately for every channel.
+
+Since only a fraction of every batch is stored, about half of it in this example, the buffer
+fills up more slowly. The arguments ``buffer_capacity`` and ``minimum_buffer_size`` count the
+stored samples after the unweighting. For broad weight distributions, it can therefore be
+necessary to reduce ``minimum_buffer_size``, so that the buffered training starts early enough.
