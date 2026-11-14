@@ -38,15 +38,18 @@ class UnweightingMetrics:
 def truncated_max_weight(
     weights: torch.Tensor, max_overweight_truncation: float = 0.01
 ) -> float:
-    """
+    r"""
     Determines the maximum weight for unweighting with the truncation prescription of
     MadGraph7. Going through the absolute weights in descending order, the maximum weight is
     the first weight ``w_max`` for which the over-weight events, i.e. those with weights
     ``|w| >= w_max``, add up to more than a fraction ``max_overweight_truncation`` of the
     expected number of unweighted events,
 
-        sum_{|w_i| >= w_max} |w_i| / w_max > max_overweight_truncation
-                                              * sum_i min(1, |w_i| / w_max) .
+    .. math::
+
+        \sum_{|w_i| \geq w_\text{max}} \frac{|w_i|}{w_\text{max}}
+        > \text{max\_overweight\_truncation} \cdot
+        \sum_i \min\left(1, \frac{|w_i|}{w_\text{max}}\right) .
 
     In MadGraph7, the right-hand side is the target number of unweighted events. Here, it is
     the number of unweighted events obtained from the given sample, such that the result does
