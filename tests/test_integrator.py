@@ -362,18 +362,84 @@ def test_metrics_methods():
     assert unweighting.cut_eff == pytest.approx(1.0)
 
 
-def test_discrete_integrand():
+def discrete_prior(x_discrete: torch.Tensor, index: int) -> torch.Tensor:
+    """prior for a single discrete dimension with three options, preferring larger values"""
+    return torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64).expand(
+        len(x_discrete), -1
+    )
+
+
+@pytest.mark.parametrize("position", ["first", "last"])
+@pytest.mark.parametrize("model", ["made", "transformer"])
+@pytest.mark.parametrize("prior", [False, True], ids=["no_prior", "prior"])
+def test_discrete_integrand(position, model, prior):
     """sum over a discrete dimension times an integral over a continuous dimension"""
+    discrete_index = 0 if position == "first" else 1
 
     def function(x):
-        return (1 + x[:, 0]) * torch.exp(-((x[:, 1] - 0.5) ** 2) / (2 * SIGMA**2))
+        k, x_cont = x[:, discrete_index], x[:, 1 - discrete_index]
+        return (1 + k) * torch.exp(-((x_cont - 0.5) ** 2) / (2 * SIGMA**2))
 
     torch.manual_seed(0)
-    integrand = Integrand(function, input_dim=2, discrete_dims=[3])
-    integrator = Integrator(integrand, batch_size=512, dtype=torch.float64)
-    integrator.train(100)
+    integrand = Integrand(
+        function,
+        input_dim=2,
+        discrete_dims=[3],
+        discrete_dims_position=position,
+        discrete_prior_prob_function=discrete_prior if prior else None,
+    )
+    discrete_flow_kwargs = (
+        {}
+        if model == "made"
+        else dict(embedding_dim=16, feedforward_dim=32, heads=2, mlp_units=32)
+    )
+    integrator = Integrator(
+        integrand,
+        batch_size=512,
+        discrete_model=model,
+        discrete_flow_kwargs=discrete_flow_kwargs,
+        dtype=torch.float64,
+    )
+    integrator.train(50)
     expected = (1 + 2 + 3) * gauss_1d_integral(0.5)
     assert_compatible(*integrator.integrate(100000), expected)
+    if prior:
+        # before training, the discrete samples follow the prior
+        untrained = Integrator(
+            integrand,
+            batch_size=512,
+            discrete_model=model,
+            discrete_flow_kwargs=discrete_flow_kwargs,
+            dtype=torch.float64,
+        )
+        k = untrained.sample(60000).x[:, discrete_index].long()
+        frequencies = torch.bincount(k, minlength=3).double() / len(k)
+        torch.testing.assert_close(
+            frequencies,
+            torch.tensor([1 / 6, 2 / 6, 3 / 6], dtype=torch.float64),
+            atol=0.01,
+            rtol=0,
+        )
+
+
+def test_multichannel_discrete_integrand():
+    """multi-channel integration with a discrete dimension and channel weights"""
+
+    def function(x, channels):
+        f, alphas = two_peaks_with_prior(x[:, 1:], channels)
+        return (1 + x[:, 0]) * f, alphas
+
+    torch.manual_seed(0)
+    integrand = Integrand(
+        function,
+        input_dim=3,
+        channel_count=2,
+        has_channel_weight_prior=True,
+        discrete_dims=[3],
+    )
+    integrator = Integrator(integrand, batch_size=512, dtype=torch.float64)
+    integrator.train(100)
+    assert_compatible(*integrator.integrate(100000), 6 * TWO_PEAKS_INTEGRAL)
 
 
 def test_purely_discrete_integrand():

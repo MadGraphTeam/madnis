@@ -196,3 +196,31 @@ def test_init_with_grid(multichannel):
             torch.testing.assert_close(
                 fractions, torch.full_like(fractions, 1 / bins), atol=4e-3, rtol=0
             )
+
+
+def test_gaussian_latent_flow_normalized():
+    """a flow with Gaussian latent space is a normalized density on R^d"""
+    torch.manual_seed(0)
+    flow = perturb(Flow(dims_in=3, uniform_latent=False).double())
+    # importance sampling with a wide Gaussian
+    scale = 2.0
+    x = scale * torch.randn((200000, 3), dtype=torch.float64)
+    log_proposal = -x.square().sum(dim=1) / (2 * scale**2) - 3 * torch.log(
+        torch.tensor(scale * (2 * torch.pi) ** 0.5)
+    )
+    with torch.no_grad():
+        ratio = (flow.log_prob(x) - log_proposal).exp()
+    error = ratio.std() / len(ratio) ** 0.5
+    assert abs(ratio.mean().item() - 1.0) < 5 * error
+
+
+def test_multichannel_flow_normalized():
+    torch.manual_seed(0)
+    flow = perturb(Flow(dims_in=3, channels=3).double())
+    for channel in range(3):
+        x = torch.rand((100000, 3), dtype=torch.float64)
+        with torch.no_grad():
+            prob = flow.prob(x, channel=channel)
+        error = prob.std() / len(prob) ** 0.5
+        assert abs(prob.mean().item() - 1.0) < 5 * error
+        assert prob.std() > 0.05
