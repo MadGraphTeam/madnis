@@ -321,8 +321,11 @@ class VegasPreTraining:
                 variance or uniformly. Note that weighting by mean can lead to problems for
                 non-positive functions
             channel: if different from None, samples are only generated for this channel
-            evaluate_integrand: If False, the integrand is not evaluated and func_vals, y and alphas are set to dummy values. This can be used when integrand
-                is expensive and one only needs the mapping jacobian.
+            evaluate_integrand: If False, the integrand is not evaluated. If the integrand has
+                a ``channel_weight_function``, it is used to compute the remapped points and
+                prior channel weights, and the integrand values are set to one. Otherwise, the
+                integrand values, remapped points and prior channel weights are set to zero or
+                None. In both cases, the weights of the samples are not integration weights.
         Returns:
             ``SampleBatch`` object, see its documentation for details
         """
@@ -389,14 +392,28 @@ class VegasPreTraining:
             if evaluate_integrand:
                 func_vals, y, alphas = self.integrand(x_torch, channels)
                 self.integrator._check_integrand_output(x_torch, func_vals, alphas)
-                if valid_channels is not None:
-                    func_vals = torch.where(
-                        valid_channels, func_vals, torch.zeros_like(func_vals)
-                    )
+            elif self.integrand.channel_weight_function is not None:
+                # only the remapped points and the prior channel weights are computed
+                _, y, alphas = self.integrand.channel_weight_function(x_torch, channels)
+                func_vals = torch.ones((x.shape[0]), dtype=self.integrator.dummy.dtype)
+                self.integrator._check_integrand_output(
+                    x_torch, torch.zeros_like(func_vals), alphas
+                )
             else:
                 func_vals = torch.zeros((x.shape[0]), dtype=self.integrator.dummy.dtype)
                 y = torch.zeros_like(x_torch)
-                alphas = torch.zeros_like(x_torch)
+                alphas = (
+                    torch.zeros(
+                        (x.shape[0], self.integrand.channel_count),
+                        dtype=self.integrator.dummy.dtype,
+                    )
+                    if self.integrator.multichannel
+                    else None
+                )
+            if valid_channels is not None:
+                func_vals = torch.where(
+                    valid_channels, func_vals, torch.zeros_like(func_vals)
+                )
 
             # TODO: assign channels if importance-sampled
             if (
