@@ -92,8 +92,9 @@ def test_get_samples_rescales_flow_probability():
     integrator = Integrator(
         cut_function, dims=2, drop_zero_integrands=True, dtype=torch.float64
     )
-    # the cut efficiency of the untrained flow is about 0.3, so several sampling rounds
-    # with batch_size_threshold = 0.5 are needed and the rescaling must use the total counts
+    # the cut efficiency of the untrained flow is about 0.3, so after the first step, more
+    # samples are drawn and the rescaling must use the total counts
+    integrator._get_samples(4096, train=True)
     samples = integrator._get_samples(4096, train=True)
     n_kept = samples.x.shape[0]
     n_total = n_kept + samples.zero_counts.item()
@@ -177,26 +178,33 @@ def channel_cut_integrand(efficiency_1: float) -> "Integrand":
     return Integrand(function, input_dim=2, channel_count=2)
 
 
-def test_missing_counts():
+def test_oversampled_counts():
+    from madnis.integrator import Integrand
+
     integrator = Integrator(
-        channel_cut_integrand(0.5),
+        Integrand(lambda x, channels: x[:, 0], input_dim=2, channel_count=4),
         batch_size_threshold=0.5,
         max_oversampling=10,
         dtype=torch.float64,
     )
-    missing = integrator._missing_counts(
-        target_counts=torch.tensor([100, 100, 100, 100, 0]),
-        generated_counts=torch.tensor([100, 100, 100, 950, 0]),
-        nonzero_counts=torch.tensor([60, 20, 0, 1, 0]),
-    )
-    # above threshold: nothing; 20% efficiency: (30 missing + 2 sqrt(30)) / 0.2;
-    # no non-zero sample yet: doubled; budget of 1000 samples: 50 left; empty: nothing
-    assert missing.tolist() == [0, 205, 100, 50, 0]
+    target = torch.tensor([100, 100, 100, 100])
+    # without previous steps, the efficiency is assumed to be one
+    assert integrator._oversampled_counts(target).tolist() == [100, 100, 100, 100]
+    channels = torch.repeat_interleave(torch.arange(4), 100)
+    nonzero = (torch.arange(400) % 100) < torch.tensor(
+        [80, 25, 0, 50]
+    ).repeat_interleave(100)
+    integrator._update_efficiencies(channels, nonzero)
+    # efficiency 0.25: 0.5 / 0.25 = 2; efficiency 0: capped; at or above threshold: unchanged
+    counts = integrator._oversampled_counts(target)
+    assert counts[1] == 200
+    assert counts[2] == 1000
+    assert counts[0] == 100
 
 
 @pytest.mark.parametrize("drop_zeros", [True, False])
-def test_resampling_only_in_channels_with_missing_samples(drop_zeros):
-    """only the channel with a low fraction of non-zero samples is sampled again"""
+def test_oversampling_only_in_channels_with_low_efficiency(drop_zeros):
+    """only the channel with a low fraction of non-zero samples gets more samples"""
     torch.manual_seed(0)
     integrator = Integrator(
         channel_cut_integrand(0.1),
@@ -204,22 +212,24 @@ def test_resampling_only_in_channels_with_missing_samples(drop_zeros):
         drop_zero_integrands=drop_zeros,
         dtype=torch.float64,
     )
+    # the first call has no efficiency estimate yet
+    integrator._get_samples(2048, uniform_channel_ratio=1.0, train=True)
+    efficiency = integrator._nonzero_ema / integrator._generated_ema
+    assert efficiency[0] == 1.0
+    assert 0.05 < efficiency[1] < 0.15
     samples = integrator._get_samples(2048, uniform_channel_ratio=1.0, train=True)
     nonzero = samples.func_vals != 0
     nonzero_counts = torch.bincount(samples.channels[nonzero], minlength=2)
+    generated = torch.bincount(samples.channels, minlength=2)
     if drop_zeros:
-        generated = torch.bincount(samples.channels, minlength=2) + samples.zero_counts
-    else:
-        generated = torch.bincount(samples.channels, minlength=2)
-    # channel 0 has no zeros and is sampled only once
+        generated = generated + samples.zero_counts
     assert generated[0] == 1024
-    # channel 1 is filled up to at least half of its requested samples, and the number of
-    # generated samples stays close to the expected 512 / 0.1
-    assert nonzero_counts[1] >= 512
-    assert 4000 < generated[1] < 8000
+    # efficiency about 0.1 -> about 0.5 / 0.1 = 5 times the requested samples
+    assert generated[1] == torch.ceil(1024 * 0.5 / efficiency[1])
+    assert 400 < nonzero_counts[1] < 650
 
 
-def test_resampling_stops_for_empty_channel():
+def test_oversampling_is_capped_for_empty_channel():
     """a channel without any non-zero samples is sampled at most max_oversampling times"""
     torch.manual_seed(0)
     integrator = Integrator(
@@ -228,7 +238,32 @@ def test_resampling_stops_for_empty_channel():
         max_oversampling=8,
         dtype=torch.float64,
     )
+    integrator._get_samples(1024, uniform_channel_ratio=1.0, train=True)
     samples = integrator._get_samples(1024, uniform_channel_ratio=1.0, train=True)
     assert (samples.channels == 0).sum() == 512
     assert (samples.channels == 1).sum() == 0
     assert samples.zero_counts.tolist() == [0, 8 * 512]
+
+
+def test_oversampling_keeps_channel_means_unbiased():
+    """
+    the channel-wise means computed during training are unbiased, also for small batches and
+    low cut efficiencies, because the number of samples is fixed before sampling
+    """
+    torch.manual_seed(0)
+    integrator = Integrator(
+        channel_cut_integrand(0.3),
+        drop_zero_integrands=True,
+        dtype=torch.float64,
+    )
+    with torch.no_grad():
+        means = []
+        for _ in range(3000):
+            samples = integrator._get_samples(40, uniform_channel_ratio=1.0, train=True)
+            means.append(integrator._compute_integral(samples)[1])
+        means = torch.stack(means)
+        reference = integrator._compute_integral(
+            integrator._get_samples(2_000_000, uniform_channel_ratio=1.0)
+        )[1]
+    error = means.std(dim=0) / len(means) ** 0.5
+    assert ((means.mean(dim=0) - reference).abs() < 4 * error).all()

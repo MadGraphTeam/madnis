@@ -24,6 +24,9 @@ from .metrics import (
     unweighting_metrics,
 )
 
+# Decay factor of the moving averages used to estimate the channel-wise cut efficiencies
+EFFICIENCY_DECAY = 0.8
+
 
 @dataclass
 class TrainingStatus:
@@ -171,7 +174,7 @@ class Integrator(nn.Module):
         integration_history_length: int = 20,
         drop_zero_integrands: bool = False,
         batch_size_threshold: float = 0.5,
-        max_oversampling: float = 100.0,
+        max_oversampling: float = 10.0,
         buffer_capacity: int = 0,
         minimum_buffer_size: int = 50,
         buffered_steps: int = 0,
@@ -226,11 +229,12 @@ class Integrator(nn.Module):
                 during the training if uniform_channel_ratio is different from one.
             drop_zero_integrands: If True, points with integrand zero are dropped and not used for
                 the optimization. See also ``rescale_dropped_zeros``.
-            batch_size_threshold: During training, new samples are drawn until the number of
-                samples with non-zero integrand is at least batch_size_threshold times the
-                number of requested samples in every channel. Only the channels below this
-                threshold are sampled again, with the number of samples that is needed to reach
-                it, estimated from their fraction of non-zero integrand values.
+            batch_size_threshold: During training, more samples are drawn in channels where the
+                fraction of samples with non-zero integrand is below this threshold, such that
+                on average at least batch_size_threshold times the requested number of samples
+                in that channel have a non-zero integrand. The fraction is estimated from the
+                previous training steps, so the number of samples is fixed before sampling and
+                the integral estimates remain unbiased.
             max_oversampling: maximal number of samples drawn for a channel in one training step
                 in units of the number of requested samples for that channel. This limits the
                 cost of channels with a very small fraction of non-zero integrand values.
@@ -429,6 +433,13 @@ class Integrator(nn.Module):
         self.grad_clip_threshold = grad_clip_threshold or None
         self.batch_size_threshold = batch_size_threshold
         self.max_oversampling = max_oversampling
+        # Exponential moving averages of the channel-wise number of generated samples and of
+        # samples with non-zero integrand during training, used to estimate the cut efficiencies
+        n_channels = self.integration_channel_count or 1
+        self.register_buffer(
+            "_generated_ema", torch.zeros(n_channels), persistent=False
+        )
+        self.register_buffer("_nonzero_ema", torch.zeros(n_channels), persistent=False)
         if loss is None:
             self.loss = stratified_variance if self.multichannel else kl_divergence
         else:
@@ -1150,44 +1161,50 @@ class Integrator(nn.Module):
             integration_channels=integration_channels,
         )
 
-    def _missing_counts(
-        self,
-        target_counts: torch.Tensor,
-        generated_counts: torch.Tensor,
-        nonzero_counts: torch.Tensor,
-    ) -> torch.Tensor:
+    def _oversampled_counts(self, target_counts: torch.Tensor) -> torch.Tensor:
         """
-        Determines how many additional samples have to be drawn in every channel during the
-        training. Channels with fewer than ``batch_size_threshold`` times the requested number of
-        samples with non-zero integrand are sampled again. The number of new samples is estimated
-        from the fraction of non-zero samples in that channel so far, such that the missing
-        number of non-zero samples is reached with a margin of two standard deviations. This
-        makes further sampling rounds unlikely. If there is no non-zero sample yet, the number of
-        samples in the channel is doubled. In total, at most
-        ``max_oversampling`` times the requested number of samples are drawn per channel.
+        Determines the number of samples drawn in every channel during the training. In channels
+        where the fraction of samples with non-zero integrand is below ``batch_size_threshold``,
+        the number of samples is increased such that on average ``batch_size_threshold`` times
+        the requested number of samples have a non-zero integrand, but at most by a factor
+        ``max_oversampling``. The fraction is estimated from the previous training steps, so the
+        number of samples does not depend on the samples of the current step. Otherwise, the
+        channel-wise means would be biased. Without previous steps, the fraction is assumed to
+        be one.
 
         Args:
             target_counts: requested number of samples per channel, shape (channels, )
-            generated_counts: number of samples drawn so far per channel, shape (channels, )
-            nonzero_counts: number of samples with non-zero integrand per channel, shape
-                (channels, )
         Returns:
             number of samples to draw per channel, shape (channels, )
         """
-        target = target_counts.double()
-        generated = generated_counts.double()
-        nonzero = nonzero_counts.double()
-        required = self.batch_size_threshold * target
-        below_threshold = nonzero < required
-        missing = (required - nonzero).clip(min=0)
-        expected = torch.where(
-            nonzero > 0,
-            (missing + 2 * missing.sqrt()) * generated / nonzero.clip(min=1),
-            generated,
+        efficiency = torch.where(
+            self._generated_ema > 0,
+            self._nonzero_ema / self._generated_ema.clip(min=1e-30),
+            torch.ones_like(self._generated_ema),
         )
-        budget = torch.floor(self.max_oversampling * target) - generated
-        counts = torch.minimum(torch.ceil(expected), budget).clip(min=0)
-        return torch.where(below_threshold, counts, 0).long()
+        factor = (self.batch_size_threshold / efficiency).clip(
+            min=1.0, max=self.max_oversampling
+        )
+        return torch.ceil(target_counts * factor).long()
+
+    def _update_efficiencies(self, channels: torch.Tensor, nonzero: torch.Tensor):
+        """
+        Updates the estimated fractions of samples with non-zero integrand in every channel.
+
+        Args:
+            channels: integration channel of every sample, shape (n, )
+            nonzero: mask of the samples with non-zero integrand, shape (n, )
+        """
+        n_channels = len(self._generated_ema)
+        dtype = self._generated_ema.dtype
+        generated = torch.bincount(channels, minlength=n_channels).to(dtype)
+        nonzero_counts = torch.bincount(channels[nonzero], minlength=n_channels).to(
+            dtype
+        )
+        # only channels that were sampled in this step are updated
+        decay = torch.where(generated > 0, EFFICIENCY_DECAY, 1.0).to(dtype)
+        self._generated_ema.mul_(decay).add_(generated)
+        self._nonzero_ema.mul_(decay).add_(nonzero_counts)
 
     def _get_samples(
         self,
@@ -1199,8 +1216,9 @@ class Integrator(nn.Module):
         evaluate_integrand: bool = True,
     ) -> SampleBatch:
         """
-        Draws samples from the flow and evaluates the integrand. In training mode, channels with
-        too few samples with non-zero integrand are sampled again, see ``_missing_counts``.
+        Draws samples from the flow and evaluates the integrand. In training mode, more samples
+        are drawn in channels with a low fraction of non-zero integrand values, see
+        ``_oversampled_counts``.
 
         Args:
             n: number of samples
@@ -1232,35 +1250,21 @@ class Integrator(nn.Module):
         else:
             target_counts = torch.full((1,), n, device=self.dummy.device)
 
-        batches_out = []
-        request_counts = target_counts
-        generated_counts = torch.zeros_like(target_counts)
-        nonzero_counts = torch.zeros_like(target_counts)
-        while True:
-            batch = self._sample_batch(request_counts, evaluate_integrand)
-            if not train or not evaluate_integrand:
-                batches_out.append(batch)
-                break
+        if train and evaluate_integrand:
+            target_counts = self._oversampled_counts(target_counts)
+        samples = self._sample_batch(target_counts, evaluate_integrand)
+        if not train or not evaluate_integrand:
+            return samples
 
-            channels = self._batch_channels(batch)
-            nonzero = batch.func_vals != 0
-            generated_counts += torch.bincount(channels, minlength=n_channels)
-            nonzero_counts += torch.bincount(channels[nonzero], minlength=n_channels)
-            if self.drop_zero_integrands:
-                zero_counts = torch.bincount(channels[~nonzero], minlength=n_channels)
-                batch = batch.map(lambda t: t[nonzero])
-                batch.zero_counts = zero_counts
-            batches_out.append(batch)
-
-            request_counts = self._missing_counts(
-                target_counts, generated_counts, nonzero_counts
+        channels = self._batch_channels(samples)
+        nonzero = samples.func_vals != 0
+        self._update_efficiencies(channels, nonzero)
+        if self.drop_zero_integrands:
+            zero_counts = torch.bincount(
+                channels[~nonzero], minlength=self.integration_channel_count or 1
             )
-            if request_counts.sum().item() == 0:
-                break
-
-        samples = SampleBatch.cat(batches_out)
-        if train and self.drop_zero_integrands:
-            # rescale once for all sampling rounds, such that the rescaling uses the total counts
+            samples = samples.map(lambda t: t[nonzero])
+            samples.zero_counts = zero_counts
             samples = self._rescale_dropped(samples)
         return samples
 
