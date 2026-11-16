@@ -164,7 +164,10 @@ class Flow(nn.Module, Distribution):
                 input and output features. Only relevant if subnet_constructor=None.
             channels: If None, build single-channel flow. If integer, build multi-channel flow
                 with this number of channels.
-            channel_remap_function: TODO
+            channel_remap_function: function that maps the channel indices passed to the flow to
+                the indices of the flow channels, for example to share one flow between all
+                channels of a channel group. It is applied to channel index tensors and integers,
+                but not to lists of channel sizes. If None, the channel indices are used directly.
             mapping: Specifies a single mapping function or a list of mapping functions (one per
                 channel) that are applied to the input before it enters the flow (forward
                 direction) or after drawing samples using the flow (inverse direction). The

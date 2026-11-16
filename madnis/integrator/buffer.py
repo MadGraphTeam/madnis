@@ -47,7 +47,8 @@ class Buffer(nn.Module):
         )
 
     @property
-    def size(self):
+    def size(self) -> int:
+        """Number of samples currently stored in the buffer"""
         return int(self._size.item())
 
     @size.setter
@@ -55,7 +56,8 @@ class Buffer(nn.Module):
         self._size.fill_(int(value))
 
     @property
-    def store_index(self):
+    def store_index(self) -> int:
+        """Index in the circular buffer where the next sample will be stored"""
         return int(self._store_index.item())
 
     @store_index.setter

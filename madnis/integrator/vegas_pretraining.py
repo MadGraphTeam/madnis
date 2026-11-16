@@ -45,7 +45,14 @@ class VegasPreTraining:
         bins: int = 64,
         damping: float = 0.7,
     ):
-        """ """
+        """
+        Args:
+            integrator: MadNIS integrator that provides the integrand, buffer and integration
+                history. In the multi-channel case, one VEGAS grid is built per channel or
+                channel group.
+            bins: number of VEGAS grid bins per dimension
+            damping: damping parameter (``alpha`` in the vegas package) of the grid adaptation
+        """
         import vegas  # vegas module is optional dependency, so import locally
 
         # TODO: also maybe replace this with our own VEGAS implementation in pytorch?

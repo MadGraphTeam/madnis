@@ -98,7 +98,8 @@ def test_integrand_bounds():
     assert f.mean().item() == pytest.approx(-2.0, rel=5e-3)
 
 
-def test_update_active_channels_mask_with_grouping():
+def test_update_active_channels_mask_passthrough():
+    """the per-channel mask is passed to the callback unchanged"""
     received = []
     integrand = Integrand(
         lambda x, c: x[:, 0],
@@ -107,10 +108,47 @@ def test_update_active_channels_mask_with_grouping():
         channel_grouping=ChannelGrouping([None, None, 0, 0, 1]),
         update_active_channels_mask=received.append,
     )
-    integrand.update_active_channels_mask(torch.tensor([True, False]))
-    torch.testing.assert_close(
-        received[0], torch.tensor([True, False, True, True, False])
+    mask = torch.tensor([True, False, True, True, False])
+    integrand.update_active_channels_mask(mask)
+    torch.testing.assert_close(received[0], mask)
+
+
+def test_integrand_bounds_with_discrete_dims():
+    """bounds only apply to the continuous dimensions, discrete indices stay unchanged"""
+    received = []
+
+    def function(x):
+        received.append(x)
+        return x[:, 1]
+
+    integrand = Integrand(
+        function,
+        input_dim=2,
+        bounds=[[1.0, 3.0]],
+        discrete_dims=[4],
+        discrete_dims_position="first",
     )
+    x = torch.tensor([[3.0, 0.5], [1.0, 0.0]])
+    f, _, _ = integrand(x, None)
+    torch.testing.assert_close(received[0], torch.tensor([[3.0, 2.0], [1.0, 1.0]]))
+    torch.testing.assert_close(f, torch.tensor([4.0, 2.0]))
+
+
+def test_integrand_bounds_wrong_length():
+    with pytest.raises(ValueError, match="continuous dimensions"):
+        Integrand(
+            lambda x: x[:, 0], input_dim=2, bounds=[[0.0, 1.0]] * 2, discrete_dims=[3]
+        )
+
+
+def test_integrand_bounds_with_sampling_function():
+    with pytest.raises(ValueError, match="function_includes_sampling"):
+        Integrand(
+            lambda c: None,
+            input_dim=1,
+            bounds=[[0.0, 2.0]],
+            function_includes_sampling=True,
+        )
 
 
 def test_update_active_channels_mask_without_grouping():

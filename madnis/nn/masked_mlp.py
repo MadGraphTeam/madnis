@@ -7,6 +7,13 @@ import torch.nn.functional as F
 
 
 class MaskedMLP(nn.Module):
+    """
+    Masked MLP with an autoregressive structure as introduced for MADE (1502.03509). The inputs
+    and outputs are split into blocks of features, and the i-th output block only depends on the
+    input blocks 0 to i. The class also supports multiple channels, i.e. independent networks
+    with the same structure, and cached evaluation for efficient autoregressive sampling.
+    """
+
     def __init__(
         self,
         input_dims: list[int],
@@ -16,6 +23,17 @@ class MaskedMLP(nn.Module):
         activation=nn.LeakyReLU,
         channels: int | None = None,
     ):
+        """
+        Args:
+            input_dims: number of features of each input block
+            output_dims: number of features of each output block. Must have the same length as
+                ``input_dims``.
+            layers: number of layers
+            nodes_per_feature: number of hidden nodes per block in each hidden layer
+            activation: function that builds a nn.Module used as activation function
+            channels: If None, build a single network. If integer, build this number of
+                independent networks.
+        """
         super().__init__()
 
         in_degrees = []
@@ -84,6 +102,10 @@ class MaskedMLP(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
+        """
+        Initializes all layers except the last one like ``nn.Linear`` and the last layer with
+        zeros, so that the network output is zero after initialization.
+        """
         for chan_weights, chan_biases in zip(self.weights, self.biases):
             for weight, bias in zip(chan_weights[:-1], chan_biases[:-1]):
                 if weight.numel() > 0:
@@ -99,6 +121,22 @@ class MaskedMLP(nn.Module):
         x: torch.Tensor,
         channel: list[int] | int | None = None,
     ) -> torch.Tensor:
+        """
+        Evaluates the network.
+
+        Args:
+            x: network input, shape (n, sum(input_dims))
+            channel: encodes the channel of the samples in the multi-channel case. It must have
+                one of the following types:
+
+                - ``list``: list of integers, specifying the number of samples in each channel;
+                - ``int``: integer specifying a single channel containing all the samples;
+                - ``None``: used in the single-channel case or to indicate that all channels
+                  contain the same number of samples in the multi-channel case. In that case,
+                  ``n`` must be divisible by the number of channels.
+        Returns:
+            network output, shape (n, sum(output_dims))
+        """
         if self.channels == 1:
             return self._forward_single(x, 0)
         elif isinstance(channel, list):
@@ -116,7 +154,7 @@ class MaskedMLP(nn.Module):
             return torch.cat(
                 [
                     self._forward_single(xi, i)
-                    for i, xi in enumerate(x.split(x.shape[0] // self.channels, dim=0))
+                    for i, xi in enumerate(x.split(self._uniform_split_size(x), dim=0))
                 ],
                 dim=0,
             )
@@ -128,6 +166,26 @@ class MaskedMLP(nn.Module):
         caches: list[list[torch.Tensor] | None] | None = None,
         channel: list[int] | int | None = None,
     ) -> tuple[torch.Tensor, list[list[torch.Tensor] | None]]:
+        """
+        Evaluates the output block ``feature`` given only the input block ``feature``, reusing
+        the hidden-layer activations of the previous blocks from the cache. This allows for
+        efficient autoregressive sampling, calling this function for ``feature = 0, 1, ...``.
+
+        Args:
+            x: input block, shape (n, input_dims[feature])
+            feature: index of the input and output block
+            caches: caches returned by the previous call, or None for ``feature = 0``
+            channel: encodes the channel of the samples in the multi-channel case. It must have
+                one of the following types:
+
+                - ``list``: list of integers, specifying the number of samples in each channel;
+                - ``int``: integer specifying a single channel containing all the samples;
+                - ``None``: used in the single-channel case or to indicate that all channels
+                  contain the same number of samples in the multi-channel case. In that case,
+                  ``n`` must be divisible by the number of channels.
+        Returns:
+            Tuple with the output block, shape (n, output_dims[feature]), and the updated caches
+        """
         caches = itertools.repeat(None) if caches is None else caches
         if self.channels == 1:
             x, cache = self._forward_cached_single(x, feature, next(iter(caches)), 0)
@@ -153,11 +211,19 @@ class MaskedMLP(nn.Module):
                 *[
                     self._forward_cached_single(xi, feature, cache, i)
                     for i, (xi, cache) in enumerate(
-                        zip(x.split(x.shape[0] // self.channels, dim=0), caches)
+                        zip(x.split(self._uniform_split_size(x), dim=0), caches)
                     )
                 ]
             )
             return torch.cat(xs, dim=0), caches
+
+    def _uniform_split_size(self, x: torch.Tensor) -> int:
+        if x.shape[0] % self.channels != 0:
+            raise ValueError(
+                f"With channel=None, the number of samples ({x.shape[0]}) must be divisible "
+                f"by the number of channels ({self.channels})"
+            )
+        return x.shape[0] // self.channels
 
     def _forward_single(self, x: torch.Tensor, channel: int) -> torch.Tensor:
         weights, biases = self.weights[channel], self.biases[channel]

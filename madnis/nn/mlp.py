@@ -27,7 +27,7 @@ class MLP(nn.Module):
             layers: number of layers
             units: number of hidden nodes
             activation: function that builds a nn.Module used as activation function
-            layer_construction: function used to construct the network layers, given the number of
+            layer_constructor: function used to construct the network layers, given the number of
                 input and output features
         """
         super().__init__()
@@ -77,7 +77,7 @@ class StackedMLP(nn.Module):
             layers: number of layers
             units: number of hidden nodes
             activation: function that builds a nn.Module used as activation function
-            layer_construction: function used to construct the network layers, given the number of
+            layer_constructor: function used to construct the network layers, given the number of
                 input and output features
         """
         super().__init__()

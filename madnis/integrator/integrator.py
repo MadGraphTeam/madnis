@@ -198,7 +198,10 @@ class Integrator(nn.Module):
             flow_kwargs: If flow is None, these keyword arguments are passed to the `Flow`
                 constructor.
             discrete_flow_kwargs: If flow is None, these keyword arguments are passed to the
-                ``MixedFlow`` or ``DiscreteMADE`` constructor.
+                constructor of the discrete model (``DiscreteMADE`` or ``DiscreteTransformer``).
+            discrete_model: If flow is None and the integrand has discrete dimensions, this
+                specifies the model used for them, ``"made"`` for ``DiscreteMADE`` or
+                ``"transformer"`` for ``DiscreteTransformer`` (single-channel only).
             train_channel_weights: If True, construct a channel weight network and train it. Only
                 necessary if cwnet is None.
             cwnet: network used for the trainable channel weights. If None and
@@ -488,6 +491,22 @@ class Integrator(nn.Module):
         if dtype is not None:
             self.to(dtype)
 
+    def _active_channels_mask_ungrouped(self) -> torch.Tensor:
+        """
+        Returns the mask of active channels for the individual channels of the integrand, i.e.
+        expanded from channel groups to channels if channels are grouped.
+
+        Returns:
+            boolean tensor with shape (channel_count, )
+        """
+        if not self.group_channels:
+            return self.active_channels_mask
+        return self.active_channels_mask[
+            self.integrand.remap_channels(
+                torch.arange(self.integrand.channel_count, device=self.dummy.device)
+            )
+        ]
+
     def _get_alphas(self, samples: SampleBatch) -> torch.Tensor:
         """
         Runs the channel weight network and returns the normalized channel weights, taking prior
@@ -513,16 +532,7 @@ class Integrator(nn.Module):
         else:
             alpha_prior = self._restore_prior(samples)
 
-        if self.group_channels:
-            active_channels_mask = self.active_channels_mask[
-                self.integrand.remap_channels(
-                    torch.arange(alpha_prior.shape[1], device=alpha_prior.device)
-                )
-            ]
-        else:
-            active_channels_mask = self.active_channels_mask
-
-        alpha = alpha_prior * active_channels_mask
+        alpha = alpha_prior * self._active_channels_mask_ungrouped()
         mask = samples.func_vals != 0
         y = self._cwnet_input(samples)
         alpha[mask] *= self.cwnet(y[mask]).exp()
@@ -839,7 +849,9 @@ class Integrator(nn.Module):
             self.active_channels_mask[cri_argsort[:n_irrelevant]]
         )
         self.active_channels_mask[cri_argsort[:n_irrelevant]] = False
-        self.integrand.update_active_channels_mask(self.active_channels_mask)
+        self.integrand.update_active_channels_mask(
+            self._active_channels_mask_ungrouped()
+        )
         self.batch_size = (
             self.batch_size_offset
             + torch.count_nonzero(self.active_channels_mask).item()
@@ -1085,8 +1097,10 @@ class Integrator(nn.Module):
             channel_weight_mode: specifies whether the channels are weighted by their mean or
                 variance. Note that weighting by mean can lead to problems for non-positive functions
             channel: if different from None, samples are only generated for this channel
-            evaluate_integrand: If False, the integrand is not evaluated and weight, y and alphas_prior are set to dummy values. This can be used when integrand
-                is expensive and one only needs the flow prob.
+            evaluate_integrand: If False, the integrand is not evaluated and weight, y and
+                alphas_prior are set to dummy values. This can be used when the integrand is
+                expensive and one only needs the flow probabilities. Ignored if the integrand
+                has ``function_includes_sampling=True``.
         Returns:
             Object containing a batch of samples
         """
@@ -1401,6 +1415,9 @@ class Integrator(nn.Module):
                 variance or uniformly. Note that weighting by mean can lead to problems for
                 non-positive functions
             channel: if different from None, samples are only generated for this channel
+            evaluate_integrand: If False, the integrand is not evaluated and the integrand values
+                and weights of the returned samples are zero. Ignored if the integrand has
+                ``function_includes_sampling=True``, as the integrand is then always evaluated.
         Returns:
             ``SampleBatch`` object, see its documentation for details
         """

@@ -7,10 +7,15 @@ import torch
 
 
 def dtype_epsilon(tensor: torch.Tensor) -> float:
+    """Returns the machine epsilon of the dtype of the given tensor"""
     return torch.finfo(tensor.dtype).eps
 
 
 def softclip(x: torch.Tensor, threshold: torch.Tensor = 30.0):
+    """
+    Soft clipping function ``threshold * arcsinh(x / threshold)``, which is approximately linear
+    for ``|x| << threshold`` and logarithmic for ``|x| >> threshold``.
+    """
     return threshold * torch.arcsinh(x / threshold)
 
 
@@ -23,7 +28,7 @@ MultiChannelLoss = Callable[
 def multi_channel_loss(loss: SingleChannelLoss) -> MultiChannelLoss:
     """
     Turns a single-channel loss function into a multi-channel loss function by evaluating it for
-    each channel separately and then adding them weighted by TODO weighted by what?
+    each channel separately and then adding them.
 
     Args:
         loss: single-channel loss function, that expects the integrand value, test probability and
@@ -141,6 +146,19 @@ def stratified_variance_softclip(
 def variance(
     f_true: torch.Tensor, q_test: torch.Tensor, q_sample: torch.Tensor
 ) -> torch.Tensor:
+    """
+    Computes the variance for two given sets of probabilities, ``f_true`` and ``q_test``,
+    normalized by the squared absolute integral. It uses importance sampling with a sampling
+    probability specified by ``q_sample``.
+
+    Args:
+        f_true: normalized integrand values
+        q_test: estimated function/probability
+        q_sample: sampling probability
+        channels: channel indices or None in the single-channel case
+    Returns:
+        computed variance
+    """
     abs_integral = torch.mean(f_true.detach().abs() / q_sample) + dtype_epsilon(f_true)
     return _variance(f_true, q_test, q_sample) / abs_integral.square()
 
