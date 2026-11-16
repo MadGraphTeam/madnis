@@ -9,6 +9,13 @@ from .masked_mlp import MaskedMLP
 
 
 class DiscreteMADE(nn.Module, Distribution):
+    """
+    Autoregressive distribution for discrete dimensions based on a masked autoencoder (MADE,
+    1502.03509). The probabilities of each discrete dimension are predicted by a masked MLP,
+    conditional on the previous dimensions and an optional condition. Both conditional and
+    non-conditional as well as multi-channel distributions are supported.
+    """
+
     def __init__(
         self,
         dims_in: list[int],
@@ -18,7 +25,22 @@ class DiscreteMADE(nn.Module, Distribution):
         channel_remap_function: Callable[[torch.Tensor], torch.Tensor] | None = None,
         **mlp_kwargs,  # TODO: replace this with default arguments for MLP
     ):
-        """ """
+        """
+        Args:
+            dims_in: number of options for each discrete dimension
+            dims_c: condition dimension
+            channels: If None, build single-channel distribution. If integer, build
+                multi-channel distribution with this number of channels.
+            prior_prob_function: function that gives prior probabilities, which are multiplied
+                with the learned probabilities. It is called with the already sampled discrete
+                dimensions, shape (n, i), and the index i of the current dimension, and must return
+                unnormalized probabilities with shape (n, dims_in[i]). If None, no prior is used.
+            channel_remap_function: function that maps the channel indices passed to the
+                distribution to the indices of its channels. It is applied to channel index
+                tensors and integers, but not to lists of channel sizes. If None, the channel
+                indices are used directly.
+            mlp_kwargs: additional keyword arguments passed to the ``MaskedMLP`` constructor
+        """
         super().__init__()
 
         self.autoreg_net = MaskedMLP(
@@ -90,7 +112,23 @@ class DiscreteMADE(nn.Module, Distribution):
         c: torch.Tensor | None = None,
         channel: torch.Tensor | list[int] | int | None = None,
     ) -> torch.Tensor:
-        """ """
+        """
+        Computes the log-probabilities of the input data.
+
+        Args:
+            x: integer input data, shape (n, len(dims_in))
+            c: condition, shape (n, dims_c) or None for an unconditional flow
+            channel: encodes the channel of the samples. It must have one of the following types:
+
+                - ``Tensor``: integer tensor of shape (n, ), containing the channel index for every
+                  input sample;
+                - ``list``: list of integers, specifying the number of samples in each channel;
+                - ``int``: integer specifying a single channel containing all the samples;
+                - ``None``: used in the single-channel case or to indicate that all channels contain
+                  the same number of samples in the multi-channel case.
+        Returns:
+            log-probabilities with shape (n, )
+        """
         if self.prior_prob_function is not None:
             prior_probs = torch.cat(
                 [
@@ -142,7 +180,29 @@ class DiscreteMADE(nn.Module, Distribution):
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        """ """
+        """
+        Draws samples following the distribution
+
+        Args:
+            n: number of samples
+            c: condition, shape (n, dims_c) or None for an unconditional flow
+            channel: encodes the channel of the samples. It must have one of the following types:
+
+                - ``Tensor``: integer tensor of shape (n, ), containing the channel index for every
+                  input sample;
+                - ``list``: list of integers, specifying the number of samples in each channel;
+                - ``int``: integer specifying a single channel containing all the samples;
+                - ``None``: used in the single-channel case or to indicate that all channels contain
+                  the same number of samples in the multi-channel case.
+            return_log_prob: if True, also return the log-probabilities
+            return_prob: if True, also return the probabilities
+            device: device of the returned tensor. Only required if no condition is given.
+            dtype: dtype of the returned tensor. Only required if no condition is given.
+        Returns:
+            integer samples with shape (n, len(dims_in)). Depending on the arguments ``return_log_prob``,
+            ``return_prob``, this function should also return the log-probabilities with shape (n, ),
+            the probabilities with shape (n, ).
+        """
         if n is None:
             n = len(c)
         if c is None:

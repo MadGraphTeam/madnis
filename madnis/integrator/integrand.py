@@ -55,17 +55,35 @@ class Integrand(nn.Module):
                   - ``alpha`` is the prior channel weight, shape (n, channel_count).
             input_dim: dimension of the integration space
             bounds: List of pairs ``[lower bound, upper bound]`` of the integration interval for
-                all dimensions. The integrand is rescaled so that the MadNIS training can be
-                performed on the unit hypercube. If None, the unit hypercube is used as integration
-                domain.
+                all continuous dimensions, i.e. excluding the discrete dimensions. The integrand
+                is rescaled so that the MadNIS training can be performed on the unit hypercube. If
+                None, the unit hypercube is used as integration domain. Not supported if
+                ``function_includes_sampling`` is True.
             channel_count: None in the single-channel case, specifies the number of channels
                 otherwise.
             remapped_dim: If different from None, it gives the dimension of a remapped space,
                 with a channel-dependent mapping computed as part of the integrand function.
             has_channel_weight_prior: If True, the integrand returns channel weights
             channel_grouping: ChannelGrouping object or None if all channels are independent
+            function_includes_sampling: If True, the integrand function generates the sample
+                points itself instead of using the flow of the integrator. Its signature is then
+                ``c -> (x, q, f, y, alpha, c_out)`` where ``c`` are the requested channel indices
+                (None in the single-channel case), ``q`` is the sampling probability of the points
+                and ``c_out`` are the channel indices of the returned points. ``y`` and ``alpha``
+                can be None.
+            update_active_channels_mask: function that is called with a boolean mask of shape
+                (channel_count, ) whenever channels are dropped during the training, so that the
+                integrand can disable the corresponding channels. If None, no function is called.
+            discrete_dims: number of options for each discrete dimension of the integration space.
+                The discrete dimensions are part of ``x``, encoded as integer indices.
+            discrete_dims_position: whether the discrete dimensions are the first or the last
+                dimensions of ``x``, ``"first"`` or ``"last"``
+            discrete_prior_prob_function: function that gives prior probabilities for the discrete
+                dimensions, which are multiplied with the learned probabilities. It is called with
+                the already sampled discrete dimensions, shape (n, i), and the index i of the
+                current discrete dimension, and must return unnormalized probabilities with shape
+                (n, discrete_dims[i]). If None, no prior is used.
         """
-        # TODO: update documentation
         super().__init__()
         self.input_dim = input_dim
         self.remapped_dim = input_dim if remapped_dim is None else remapped_dim
@@ -106,10 +124,30 @@ class Integrand(nn.Module):
             self.function = func
 
         if bounds is not None:
+            if function_includes_sampling:
+                raise ValueError(
+                    "bounds are not supported if function_includes_sampling is True"
+                )
+            continuous_dims = input_dim - len(discrete_dims)
+            if len(bounds) != continuous_dims:
+                raise ValueError(
+                    f"Expected bounds for {continuous_dims} continuous dimensions, "
+                    f"got {len(bounds)}"
+                )
             bounds = torch.tensor(bounds)
-            self.register_buffer("scale", bounds[:, 1] - bounds[:, 0])
-            self.register_buffer("offset", bounds[:, 0])
-            self.register_buffer("scale_det", self.scale.prod())
+            # Discrete dimensions are passed through unchanged
+            scale = torch.ones(input_dim)
+            offset = torch.zeros(input_dim)
+            continuous_slice = (
+                slice(len(discrete_dims), None)
+                if discrete_dims_position == "first"
+                else slice(0, continuous_dims)
+            )
+            scale[continuous_slice] = bounds[:, 1] - bounds[:, 0]
+            offset[continuous_slice] = bounds[:, 0]
+            self.register_buffer("scale", scale)
+            self.register_buffer("offset", offset)
+            self.register_buffer("scale_det", scale.prod())
             old_func = self.function
 
             def rescaled_func(x, channels):
@@ -160,20 +198,28 @@ class Integrand(nn.Module):
             return self.channel_id_map[channels]
 
     def update_active_channels_mask(self, mask: torch.Tensor) -> None:
-        if self.update_active_channels_mask_func is None:
-            return
-        if self.channel_grouping is None:
-            self.update_active_channels_mask_func(mask)
-            return
+        """
+        Passes the mask of active channels to the ``update_active_channels_mask`` function given
+        in the constructor, if it was provided.
 
-        full_mask = mask[
-            self.remap_channels(
-                torch.arange(len(self.channel_grouping.channels), device=mask.device)
-            )
-        ]
-        self.update_active_channels_mask_func(full_mask)
+        Args:
+            mask: boolean tensor with shape (channel_count, ), True for active channels
+        """
+        if self.update_active_channels_mask_func is not None:
+            self.update_active_channels_mask_func(mask)
 
     def forward(
         self, x: torch.Tensor, channels: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """
+        Evaluates the integrand. Not supported if ``function_includes_sampling`` is True.
+
+        Args:
+            x: points in the unit hypercube, shape (n, input_dim)
+            channels: channel indices, shape (n, ), or None in the single-channel case
+        Returns:
+            Tuple ``(f, y, alpha)`` with the integrand values ``f``, shape (n, ), the remapped
+            points ``y``, shape (n, remapped_dim) or None, and the prior channel weights ``alpha``,
+            shape (n, channel_count) or None.
+        """
         return self.function(x, channels)

@@ -274,3 +274,19 @@ def test_invalid_mixed_flow_options():
         MixedFlow(2, [3], discrete_model="unknown")
     with pytest.raises(NotImplementedError, match="single-channel"):
         MixedFlow(2, [3], discrete_model="transformer", channels=2)
+
+
+def test_masked_mlp_uniform_channels_not_divisible():
+    mlp = MaskedMLP([1, 1], [2, 2], channels=3)
+    with pytest.raises(ValueError, match="divisible"):
+        mlp(torch.zeros((10, 2)))
+    with pytest.raises(ValueError, match="divisible"):
+        mlp.forward_cached(torch.zeros((10, 1)), 0)
+
+
+def test_discrete_transformer_rejects_channel():
+    model = DiscreteTransformer([3, 2])
+    with pytest.raises(ValueError, match="channel=None"):
+        model.sample(4, channel=0, dtype=torch.float32)
+    with pytest.raises(ValueError, match="channel=None"):
+        model.log_prob(torch.zeros((4, 2), dtype=torch.int64), channel=0)
