@@ -187,6 +187,11 @@ class Buffer(nn.Module):
         ]
 
 
+# Above this fraction of requested to stored samples in a channel, ChannelBuffer.sample draws
+# without replacement to avoid frequent duplicates
+EXACT_SAMPLING_FRACTION = 0.1
+
+
 class ChannelBuffer(nn.Module):
     """
     Set of circular buffers, one for every channel, for multiple tensors with different shapes.
@@ -320,32 +325,51 @@ class ChannelBuffer(nn.Module):
 
     def sample(self, counts: torch.Tensor) -> list[torch.Tensor | None]:
         """
-        Returns a batch of samples drawn from the buffer without replacement, with a given number
-        of samples for every channel. If a channel contains fewer samples than requested, all its
-        samples are returned.
+        Returns a batch of samples drawn from the buffer, with a given number of samples for
+        every channel. If a channel contains fewer samples than requested, all its samples are
+        returned. In channels where more than ``EXACT_SAMPLING_FRACTION`` of the stored samples
+        are requested, the samples are drawn without replacement. In the other channels, they are
+        drawn with replacement, which is much cheaper for large buffers and rarely gives
+        duplicates in that case. In both cases, every stored sample is equally likely.
 
         Args:
             counts: number of samples for every channel, shape (channels, )
         Returns:
             samples drawn from the buffer, ordered by channel
         """
-        counts = torch.minimum(counts.to(self.sizes.device), self.sizes)
-        sample_channels = torch.nonzero(counts > 0)[:, 0]
-        sizes = self.sizes[sample_channels]
-        max_size = int(sizes.max().item()) if len(sample_channels) > 0 else 0
-        max_count = int(counts.max().item())
-        # Taking the samples with the smallest random keys is equivalent to drawing without
-        # replacement. The unused entries get keys larger than one and are never selected.
-        keys = torch.rand((len(sample_channels), max_size), device=self.sizes.device)
-        arange = torch.arange(max_size, device=self.sizes.device)
+        device = self.sizes.device
+        counts = torch.minimum(counts.to(device), self.sizes)
+        exact = counts > EXACT_SAMPLING_FRACTION * self.sizes
+
+        # with replacement: independent uniform positions, cost proportional to the batch size
+        fast_counts = torch.where(exact, 0, counts)
+        fast_channels = torch.repeat_interleave(
+            torch.arange(self.channels, device=device), fast_counts
+        )
+        fast_positions = (
+            torch.rand(len(fast_channels), device=device) * self.sizes[fast_channels]
+        ).long()
+
+        # Without replacement: taking the samples with the smallest random keys is equivalent
+        # to drawing without replacement. The unused entries get keys larger than one and are
+        # never selected. This only runs for channels where a large fraction of the stored
+        # samples is requested, so the cost is comparable to the batch size.
+        exact_channels = torch.nonzero(exact & (counts > 0))[:, 0]
+        exact_counts = counts[exact_channels]
+        sizes = self.sizes[exact_channels]
+        max_size = int(sizes.max().item()) if len(exact_channels) > 0 else 0
+        max_count = int(exact_counts.max().item()) if len(exact_channels) > 0 else 0
+        keys = torch.rand((len(exact_channels), max_size), device=device)
+        arange = torch.arange(max_size, device=device)
         keys.masked_fill_(arange[None, :] >= sizes[:, None], 2.0)
         positions = torch.topk(keys, max_count, dim=1, largest=False).indices
-        mask = (
-            torch.arange(max_count, device=self.sizes.device)[None, :]
-            < counts[sample_channels, None]
+        mask = torch.arange(max_count, device=device)[None, :] < exact_counts[:, None]
+        channels = torch.cat(
+            [fast_channels, exact_channels[:, None].expand(-1, max_count)[mask]]
         )
-        channels = sample_channels[:, None].expand(-1, max_count)[mask]
-        positions = positions[mask]
+        positions = torch.cat([fast_positions, positions[mask]])
+        order = torch.argsort(channels, stable=True)
+        channels, positions = channels[order], positions[order]
         return [
             None if buffer is None else buffer[channels, positions]
             for buffer in self._buffer_fields()

@@ -190,3 +190,23 @@ def test_channel_buffer_state_dict():
     loaded.load_state_dict(buffer.state_dict())
     assert loaded.sizes.tolist() == [1, 1, 2]
     torch.testing.assert_close(list(loaded)[2], list(buffer)[2])
+
+
+def test_channel_buffer_sample_large_buffer():
+    """small requests from large buffers are drawn with replacement, but stay uniform"""
+    buffer = make_channel_buffer(channels=2, capacity=1000)
+    buffer.store(*channel_batch([0] * 1000 + [1] * 300, 0))
+    torch.manual_seed(0)
+    counts = torch.zeros(1300)
+    for _ in range(2000):
+        # 50 of 1000 is drawn with replacement, 100 of 300 without replacement
+        x, _, index = buffer.sample(torch.tensor([50, 100]))
+        assert len(index) == 150
+        torch.testing.assert_close(x[:, 0], index.float())
+        # ordered by channel, and exact channel has no duplicates
+        assert (index[:50] < 1000).all() and (index[50:] >= 1000).all()
+        assert len(set(index[50:].tolist())) == 100
+        counts += torch.bincount(index, minlength=1300)
+    # every sample is drawn 100 times on average in channel 0 and 667 times in channel 1
+    assert ((counts[:1000] - 100).abs() < 50).all()
+    assert ((counts[1000:] - 2000 * 100 / 300).abs() < 120).all()
