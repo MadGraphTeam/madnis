@@ -152,6 +152,7 @@ this can be done using the :py:class:`Integrand <madnis.integrator.Integrand>` c
 .. code-block:: python
 
     def integrand_func(x, channel):
+        x = x.clamp(1e-6, 1 - 1e-6)  # avoid infinities at the boundaries
         y = torch.sigmoid(torch.logit(x) + channel[:,None] - 0.5)
         jac = torch.prod(y*(1-y) / (x * (1-x)), dim=-1)
         dist = 0.3
@@ -219,6 +220,7 @@ that we can turn one channel into the other with the simple transformation :math
     from madnis.integrator import ChannelGrouping
 
     def integrand_func(x, channel):
+        x = x.clamp(1e-6, 1 - 1e-6)  # avoid infinities at the boundaries
         y_0 = torch.sigmoid(torch.logit(x) - 0.5)
         y = torch.where(channel[:,None] == 1, 1 - y_0, y_0)
         jac = torch.prod(y*(1-y) / (x * (1-x)), dim=-1)

@@ -87,6 +87,8 @@ scheduler has to be constructed. This can be done by defining a function that re
 with the optimizer as a parameter. For instance, the following code sets cosine annealing as the
 learning rate scheduling.
 
+.. skip: next
+
 .. code-block:: python
 
     from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -99,6 +101,8 @@ If a learning rate scheduler is given, the learning rate used for the current tr
 will be given in the :py:class:`TrainingStatus <madnis.integrator.TrainingStatus>` object.
 Similarly, we can also set the optimizer by passing a function that constructs the optimizer given
 the trainable parameters. For instance, to use the ``SGD`` optimizer instead of ``Adam``, we can use
+
+.. skip: next
 
 .. code-block:: python
 
@@ -114,6 +118,8 @@ MadGraph7. The gradients of all trained parameters are rescaled such that their 
 exceed ``grad_clip_threshold * sqrt(n)``, where ``n`` is the number of trained parameters. In other
 words, the root mean square of the gradient components is at most ``grad_clip_threshold``.
 MadGraph7 uses
+
+.. skip: next
 
 .. code-block:: python
 
@@ -206,6 +212,8 @@ The saved state includes all network parameters and the integration history, but
 training samples.
 
 .. code-block:: python
+
+    import torch
 
     # save integrator
     torch.save(integrator.state_dict(), "integrator.pth")
