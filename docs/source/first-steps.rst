@@ -204,7 +204,8 @@ enable it with a few additional arguments to the integrator.
     result, error = integrator.integral()
     print(integrator.integration_metrics(1000000).rel_stddev)
 
-We set the buffer capacity such that up to 102400 points are buffered. ``minimum_buffer_size``
+We set the buffer capacity such that up to 102400 points are buffered. In the multi-channel case,
+this is the capacity for every channel. ``minimum_buffer_size``
 sets the minimum amount of samples in the buffer necessary to start training on them. With the
 default batch size of 1024, this means that the buffered training starts after the first four
 batches in our example. ``buffered_steps`` specifies how many optimization steps on buffered samples

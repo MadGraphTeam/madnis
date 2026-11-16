@@ -14,7 +14,7 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from ..nn import MLP, DiscreteMADE, DiscreteTransformer, Distribution, Flow, MixedFlow
-from .buffer import Buffer
+from .buffer import Buffer, ChannelBuffer
 from .integrand import Integrand
 from .losses import MultiChannelLoss, kl_divergence, stratified_variance, variance
 from .metrics import (
@@ -227,10 +227,13 @@ class Integrator(nn.Module):
                 the optimization. See also ``rescale_dropped_zeros``.
             batch_size_threshold: New samples are drawn until the number of samples is at least
                 batch_size_threshold * batch_size.
-            buffer_capacity: number of samples that are stored for buffered training
-            minimum_buffer_size: minimal size of the buffer to run buffered training
+            buffer_capacity: number of samples that are stored for buffered training in every
+                channel
+            minimum_buffer_size: minimal total number of buffered samples, summed over all
+                channels, to run buffered training
             buffered_steps: number of optimization steps on buffered samples after every online
-                training step
+                training step. The number of buffered samples per channel in each step is
+                chosen in the same way as for the online training.
             max_stored_channel_weights: number of prior channel weights that are buffered for each
                 sample. If None, all prior channel weights are saved, otherwise only those for the
                 channels with the largest contributions.
@@ -459,8 +462,12 @@ class Integrator(nn.Module):
                 None,
                 None,
             ]
-            self.buffer = Buffer(
-                buffer_capacity, buffer_fields, persistent=False, dtypes=buffer_dtypes
+            self.buffer = ChannelBuffer(
+                self.integration_channel_count or 1,
+                buffer_capacity,
+                buffer_fields,
+                persistent=False,
+                dtypes=buffer_dtypes,
             )
         else:
             self.buffer = None
@@ -846,17 +853,7 @@ class Integrator(nn.Module):
             * self.batch_size_per_channel
         )
         if self.buffer is not None:
-
-            def filter_func(batch):
-                samples = SampleBatch(*batch)
-                channels = (
-                    samples.channels
-                    if samples.integration_channels is None
-                    else samples.integration_channels
-                )
-                return self.active_channels_mask[channels]
-
-            self.buffer.filter(filter_func)
+            self.buffer.clear(~self.active_channels_mask)
         return n_disabled
 
     def _store_samples(self, samples: SampleBatch):
@@ -903,7 +900,7 @@ class Integrator(nn.Module):
                 :, : self.max_stored_channel_weights
             ].clone()
 
-        self.buffer.store(*samples)
+        self.buffer.store(self._batch_channels(samples), *samples)
 
     def _get_channels(
         self,
@@ -953,21 +950,21 @@ class Integrator(nn.Module):
             )
             n_per_channel += torch.ceil(probs * n_weighted / probs.sum()).int()
 
-        remove_chan = 0
-        while n_per_channel.sum() > n:
-            if n_per_channel[remove_chan] > 0:
-                n_per_channel[remove_chan] -= 1
-            remove_chan = (remove_chan + 1) % self.integration_channel_count
-        assert n_per_channel.sum() == n
+        # Remove the excess samples from rounding up by going through the non-empty channels in
+        # a round-robin fashion. Every iteration of the loop removes one sample from each of the
+        # first channels, so it runs only a few times.
+        excess = int(n_per_channel.sum().item()) - int(n)
+        while excess > 0:
+            non_empty = n_per_channel > 0
+            remove = non_empty & (torch.cumsum(non_empty, dim=0) <= excess)
+            n_per_channel -= remove.long()
+            excess -= int(remove.sum().item())
 
         if return_counts:
             return n_per_channel
 
-        return torch.cat(
-            [
-                torch.full((npc,), i, device=self.dummy.device)
-                for i, npc in enumerate(n_per_channel)
-            ]
+        return torch.repeat_interleave(
+            torch.arange(len(n_per_channel), device=self.dummy.device), n_per_channel
         )
 
     def _unweight_for_buffer(self, samples: SampleBatch) -> SampleBatch:
@@ -1227,7 +1224,17 @@ class Integrator(nn.Module):
                 self.step_type_count += 1
         else:
             buffered = True
-            samples = SampleBatch(*self.buffer.sample(self.batch_size))
+            if self.multichannel:
+                # the buffered batch is split up between the channels like in online training
+                counts = self._get_channels(
+                    self.batch_size,
+                    self._get_channel_contributions(True, "variance"),
+                    self.uniform_channel_ratio,
+                    return_counts=True,
+                )
+            else:
+                counts = torch.full((1,), self.batch_size, device=self.dummy.device)
+            samples = SampleBatch(*self.buffer.sample(counts))
             loss, _, _, _ = self._optimization_step(samples)
             self.step_type_count = (self.step_type_count + 1) % (
                 self.buffered_steps + 1

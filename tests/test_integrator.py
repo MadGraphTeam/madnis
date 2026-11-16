@@ -298,12 +298,17 @@ def test_buffered_training(multichannel):
     # the buffer exceeds the minimum size after two online steps
     assert buffered[:6] == [False, False, True, True, False, True]
     assert buffered[3:] == ([True, False, True] * 9)
-    assert integrator.buffer.size == 5000
     if multichannel:
+        # the capacity is per channel, 11 online steps do not fill both channels
+        assert integrator.buffer.size == 11 * 512
+        assert (integrator.buffer.sizes < 5000).all()
         assert integrator.buffer.buffer5.shape == (
+            2,
             5000,
             1,
         )  # compressed channel weights
+    else:
+        assert integrator.buffer.size == 5000
     assert_compatible(*integrator.integrate(100000), TWO_PEAKS_INTEGRAL)
 
 
@@ -623,3 +628,40 @@ def test_invalid_discrete_options(discrete_dims):
 def test_invalid_grouping_mode():
     with pytest.raises(ValueError, match="grouping mode"):
         Integrator(grouped_integrand(), channel_grouping_mode="unknown")
+
+
+def test_buffered_batch_follows_channel_contributions(monkeypatch):
+    """buffered batches are split between the channels like the online batches"""
+    torch.manual_seed(0)
+    integrator = Integrator(
+        multichannel_integrand(),
+        batch_size=1000,
+        uniform_channel_ratio=0.2,
+        integration_history_length=5,
+        buffer_capacity=20000,
+        minimum_buffer_size=1000,
+        buffered_steps=1,
+        dtype=torch.float64,
+    )
+    integrator.train(20)
+
+    expected = integrator._get_channels(
+        integrator.batch_size,
+        integrator._get_channel_contributions(True, "variance"),
+        integrator.uniform_channel_ratio,
+        return_counts=True,
+    )
+    assert expected[0] != expected[1]
+    batches = []
+    optimization_step = integrator._optimization_step
+
+    def record(samples):
+        batches.append(samples)
+        return optimization_step(samples)
+
+    monkeypatch.setattr(integrator, "_optimization_step", record)
+    status = integrator.train_step()
+    assert status.buffered
+    torch.testing.assert_close(
+        torch.bincount(batches[0].channels, minlength=2), expected
+    )
