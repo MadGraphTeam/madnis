@@ -210,3 +210,10 @@ def test_channel_buffer_sample_large_buffer():
     # every sample is drawn 100 times on average in channel 0 and 667 times in channel 1
     assert ((counts[:1000] - 100).abs() < 50).all()
     assert ((counts[1000:] - 2000 * 100 / 300).abs() < 120).all()
+
+
+def test_channel_buffer_default_dtypes():
+    buffer = ChannelBuffer(2, 5, [(3,), ()])
+    buffer.store(torch.tensor([0, 1, 1]), torch.rand((3, 3)), torch.rand(3))
+    assert all(field.dtype == torch.get_default_dtype() for field in buffer)
+    assert buffer.sizes.tolist() == [1, 2]

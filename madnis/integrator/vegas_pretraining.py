@@ -336,7 +336,7 @@ class VegasPreTraining:
                 False, channel_weight_mode
             )
             samples_per_channel = self.integrator._get_channels(
-                n, channel_weights, uniform_channel_ratio, return_counts=True
+                n, channel_weights, uniform_channel_ratio
             )
         else:
             samples_per_channel = torch.zeros((len(self.grids),), dtype=torch.int64)

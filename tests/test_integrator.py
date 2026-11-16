@@ -649,7 +649,6 @@ def test_buffered_batch_follows_channel_contributions(monkeypatch):
         integrator.batch_size,
         integrator._get_channel_contributions(True, "variance"),
         integrator.uniform_channel_ratio,
-        return_counts=True,
     )
     assert expected[0] != expected[1]
     batches = []
@@ -692,3 +691,15 @@ def test_buffered_batch_filled_up_from_other_channels():
     # fewer buffered samples than the batch size: all samples are used
     integrator.buffer.clear(torch.tensor([True, False]))
     assert integrator._buffered_counts().tolist() == [0, 100]
+
+
+def test_sample_batch_cat_adds_zero_counts():
+    batches = [
+        SampleBatch(torch.rand((n, 2)), None, torch.ones(n), torch.ones(n), None)
+        for n in (3, 4)
+    ]
+    batches[0].zero_counts = torch.tensor([1, 2])
+    batches[1].zero_counts = torch.tensor([3, 4])
+    cat = SampleBatch.cat(batches)
+    assert len(cat.x) == 7
+    assert cat.zero_counts.tolist() == [4, 6]

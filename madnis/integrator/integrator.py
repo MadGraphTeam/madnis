@@ -926,10 +926,9 @@ class Integrator(nn.Module):
         n: int,
         channel_weights: torch.Tensor,
         uniform_channel_ratio: float,
-        return_counts: bool = False,
     ) -> torch.Tensor:
         """
-        Create a tensor of channel indices or number of samples per channel in two steps:
+        Determines the number of samples per channel in two steps:
         1. Split up n * uniform_channel_ratio equally among all the channels
         2. Sample the rest of the events from the distribution given by channel_weights
            after correcting for the uniformly distributed samples
@@ -940,11 +939,8 @@ class Integrator(nn.Module):
             channel_weights: Weights of the channels (not normalized) with shape (channels,)
             uniform_channel_ratio: Number between 0.0 and 1.0 to determine the ratio of samples
                 that will be distributed uniformly first
-            return_counts: If True, return number of samples per channels, otherwise the channel
-                indices
         Returns:
-            If return_counts is True, Tensor with number of samples per channel, shape (channels,).
-            Otherwise, Tensor of channel numbers with shape (n,)
+            Tensor with number of samples per channel, shape (channels,)
         """
         assert channel_weights.shape == (self.integration_channel_count,)
         n_active_channels = torch.count_nonzero(self.active_channels_mask).item()
@@ -978,13 +974,7 @@ class Integrator(nn.Module):
             remove = non_empty & (torch.cumsum(non_empty, dim=0) <= excess)
             n_per_channel -= remove.long()
             excess -= int(remove.sum().item())
-
-        if return_counts:
-            return n_per_channel
-
-        return torch.repeat_interleave(
-            torch.arange(len(n_per_channel), device=self.dummy.device), n_per_channel
-        )
+        return n_per_channel
 
     def _unweight_for_buffer(self, samples: SampleBatch) -> SampleBatch:
         """
@@ -1245,7 +1235,6 @@ class Integrator(nn.Module):
                 n,
                 self._get_channel_contributions(train, channel_weight_mode),
                 uniform_channel_ratio,
-                return_counts=True,
             )
         else:
             target_counts = torch.full((1,), n, device=self.dummy.device)
@@ -1283,7 +1272,6 @@ class Integrator(nn.Module):
                 self.batch_size,
                 self._get_channel_contributions(True, "variance"),
                 self.uniform_channel_ratio,
-                return_counts=True,
             )
         else:
             requested = torch.full((1,), self.batch_size, device=self.dummy.device)

@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from madnis.integrator import Integrator, VegasPreTraining
+from madnis.integrator import Integrand, Integrator, VegasPreTraining
 from madnis.integrator.integrator import SampleBatch
 from madnis.integrator.losses import stratified_variance
 
@@ -167,9 +167,8 @@ def test_vegas_buffer_with_dropped_zeros():
     assert len(weights) < 0.8 * n_generated
 
 
-def channel_cut_integrand(efficiency_1: float) -> "Integrand":
+def channel_cut_integrand(efficiency_1: float) -> Integrand:
     """two channels, channel 1 has the given fraction of non-zero integrand values"""
-    from madnis.integrator import Integrand
 
     def function(x, channels):
         keep = (channels == 0) | (x[:, 0] < efficiency_1)
@@ -179,8 +178,6 @@ def channel_cut_integrand(efficiency_1: float) -> "Integrand":
 
 
 def test_oversampled_counts():
-    from madnis.integrator import Integrand
-
     integrator = Integrator(
         Integrand(lambda x, channels: x[:, 0], input_dim=2, channel_count=4),
         batch_size_threshold=0.5,
