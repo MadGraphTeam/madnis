@@ -239,7 +239,7 @@ class Integrator(nn.Module):
                 in units of the number of requested samples for that channel. This limits the
                 cost of channels with a very small fraction of non-zero integrand values.
             buffer_capacity: number of samples that are stored for buffered training in every
-                channel
+                integration channel, i.e. in every channel group if channel grouping is used
             minimum_buffer_size: minimal total number of buffered samples, summed over all
                 channels, to run buffered training
             buffered_steps: number of optimization steps on buffered samples after every online
@@ -1268,6 +1268,47 @@ class Integrator(nn.Module):
             samples = self._rescale_dropped(samples)
         return samples
 
+    def _buffered_counts(self) -> torch.Tensor:
+        """
+        Determines the number of samples per channel for a buffered training step. The batch is
+        split up between the channels like in online training. If a channel does not contain
+        enough buffered samples, the missing samples are taken from the other channels,
+        proportional to their number of requested samples.
+
+        Returns:
+            number of samples per channel, shape (channels, )
+        """
+        if self.multichannel:
+            requested = self._get_channels(
+                self.batch_size,
+                self._get_channel_contributions(True, "variance"),
+                self.uniform_channel_ratio,
+                return_counts=True,
+            )
+        else:
+            requested = torch.full((1,), self.batch_size, device=self.dummy.device)
+        sizes = self.buffer.sizes
+        counts = torch.minimum(requested, sizes)
+        missing = min(self.batch_size, int(sizes.sum().item())) - int(
+            counts.sum().item()
+        )
+        # Every iteration adds at least one sample, and usually the first one is sufficient.
+        while missing > 0:
+            spare = sizes - counts
+            weights = torch.where(spare > 0, requested.clip(min=1), 0).to(
+                self.dummy.dtype
+            )
+            extra = torch.minimum(
+                spare, torch.ceil(missing * weights / weights.sum()).long()
+            )
+            # remove the excess from rounding up, starting with the last channels
+            extra = torch.minimum(
+                extra, (missing - (torch.cumsum(extra, dim=0) - extra)).clip(min=0)
+            )
+            counts += extra
+            missing -= int(extra.sum().item())
+        return counts
+
     def train_step(self) -> TrainingStatus:
         """
         Performs a single training step
@@ -1293,17 +1334,7 @@ class Integrator(nn.Module):
                 self.step_type_count += 1
         else:
             buffered = True
-            if self.multichannel:
-                # the buffered batch is split up between the channels like in online training
-                counts = self._get_channels(
-                    self.batch_size,
-                    self._get_channel_contributions(True, "variance"),
-                    self.uniform_channel_ratio,
-                    return_counts=True,
-                )
-            else:
-                counts = torch.full((1,), self.batch_size, device=self.dummy.device)
-            samples = SampleBatch(*self.buffer.sample(counts))
+            samples = SampleBatch(*self.buffer.sample(self._buffered_counts()))
             loss, _, _, _ = self._optimization_step(samples)
             self.step_type_count = (self.step_type_count + 1) % (
                 self.buffered_steps + 1

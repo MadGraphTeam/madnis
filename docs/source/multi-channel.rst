@@ -303,11 +303,18 @@ by only buffering the channel weights of channels with large contributions. The 
 ``max_stored_channel_weights`` of the :py:class:`Integrator <madnis.integrator.Integrator>` class
 specifies the number of stored channel weights. Note that if this option is enabled, both the
 weights and indices of the channels have to be stored, so the amount of memory used is
-``2 * channels * buffer_capacity * max_stored_channel_weights * 8`` in double precision mode.
+``2 * channels * buffer_capacity * max_stored_channel_weights * 8`` in double precision mode,
+where ``channels`` is the number of integration channels (channel groups if channel grouping is
+used).
 
-The buffer for buffered training is kept separately for every channel, and ``buffer_capacity``
-specifies the number of stored samples per channel. Hence, channels with small contributions are
-not pushed out of the buffer by channels with many samples. The buffered batches are split up
-between the channels in the same way as the batches of the online training, i.e. using the
-channel-wise variances from the integration history and the ``uniform_channel_ratio``.
-``minimum_buffer_size`` refers to the total number of buffered samples in all channels.
+The buffer for buffered training is kept separately for every integration channel, and
+``buffer_capacity`` specifies the number of stored samples per integration channel. Hence,
+channels with small contributions are not pushed out of the buffer by channels with many samples.
+The memory of the buffer is allocated in advance and grows linearly with the number of channels.
+Note that this differs from MadNIS 1.x, where ``buffer_capacity`` was the total capacity, so
+existing settings have to be divided by the number of channels to keep the same memory usage.
+The buffered batches are split up between the channels in the same way as the batches of the
+online training, i.e. using the channel-wise variances from the integration history and the
+``uniform_channel_ratio``. If a channel does not have enough buffered samples, the batch is filled
+up with samples from the other channels. ``minimum_buffer_size`` refers to the total number of
+buffered samples in all channels.

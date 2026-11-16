@@ -665,3 +665,30 @@ def test_buffered_batch_follows_channel_contributions(monkeypatch):
     torch.testing.assert_close(
         torch.bincount(batches[0].channels, minlength=2), expected
     )
+
+
+def test_buffered_batch_filled_up_from_other_channels():
+    """if a channel has too few buffered samples, the batch is filled from the others"""
+    torch.manual_seed(0)
+    integrator = Integrator(
+        multichannel_integrand(),
+        batch_size=1000,
+        buffer_capacity=2000,
+        dtype=torch.float64,
+    )
+    x = torch.rand((1300, 2), dtype=torch.float64)
+    func_vals, alphas = multichannel_integrand().function(x, None)[::2]
+    channels = (
+        torch.arange(1300) >= 1200
+    ).long()  # 1200 in channel 0, 100 in channel 1
+    integrator._store_samples(
+        SampleBatch(x, None, torch.ones(1300), func_vals, channels, alphas)
+    )
+    # uniform channel weights request 500 per channel
+    counts = integrator._buffered_counts()
+    assert counts.tolist() == [900, 100]
+    batch = SampleBatch(*integrator.buffer.sample(counts))
+    assert len(batch.x) == 1000
+    # fewer buffered samples than the batch size: all samples are used
+    integrator.buffer.clear(torch.tensor([True, False]))
+    assert integrator._buffered_counts().tolist() == [0, 100]
