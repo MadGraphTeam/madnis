@@ -314,12 +314,17 @@ def test_buffered_training(multichannel):
     # the buffer exceeds the minimum size after two online steps
     assert buffered[:6] == [False, False, True, True, False, True]
     assert buffered[3:] == ([True, False, True] * 9)
-    assert integrator.buffer.size == 5000
     if multichannel:
+        # the capacity is per channel, 11 online steps do not fill both channels
+        assert integrator.buffer.size == 11 * 512
+        assert (integrator.buffer.sizes < 5000).all()
         assert integrator.buffer.buffer5.shape == (
+            2,
             5000,
             1,
         )  # compressed channel weights
+    else:
+        assert integrator.buffer.size == 5000
     assert_compatible(*integrator.integrate(100000), TWO_PEAKS_INTEGRAL)
 
 
@@ -639,3 +644,78 @@ def test_invalid_discrete_options(discrete_dims):
 def test_invalid_grouping_mode():
     with pytest.raises(ValueError, match="grouping mode"):
         Integrator(grouped_integrand(), channel_grouping_mode="unknown")
+
+
+def test_buffered_batch_follows_channel_contributions(monkeypatch):
+    """buffered batches are split between the channels like the online batches"""
+    torch.manual_seed(0)
+    integrator = Integrator(
+        multichannel_integrand(),
+        batch_size=1000,
+        uniform_channel_ratio=0.2,
+        integration_history_length=5,
+        buffer_capacity=20000,
+        minimum_buffer_size=1000,
+        buffered_steps=1,
+        dtype=torch.float64,
+    )
+    integrator.train(20)
+
+    expected = integrator._get_channels(
+        integrator.batch_size,
+        integrator._get_channel_contributions(True, "variance"),
+        integrator.uniform_channel_ratio,
+    )
+    assert expected[0] != expected[1]
+    batches = []
+    optimization_step = integrator._optimization_step
+
+    def record(samples):
+        batches.append(samples)
+        return optimization_step(samples)
+
+    monkeypatch.setattr(integrator, "_optimization_step", record)
+    status = integrator.train_step()
+    assert status.buffered
+    torch.testing.assert_close(
+        torch.bincount(batches[0].channels, minlength=2), expected
+    )
+
+
+def test_buffered_batch_filled_up_from_other_channels():
+    """if a channel has too few buffered samples, the batch is filled from the others"""
+    torch.manual_seed(0)
+    integrator = Integrator(
+        multichannel_integrand(),
+        batch_size=1000,
+        buffer_capacity=2000,
+        dtype=torch.float64,
+    )
+    x = torch.rand((1300, 2), dtype=torch.float64)
+    func_vals, alphas = multichannel_integrand().function(x, None)[::2]
+    channels = (
+        torch.arange(1300) >= 1200
+    ).long()  # 1200 in channel 0, 100 in channel 1
+    integrator._store_samples(
+        SampleBatch(x, None, torch.ones(1300), func_vals, channels, alphas)
+    )
+    # uniform channel weights request 500 per channel
+    counts = integrator._buffered_counts()
+    assert counts.tolist() == [900, 100]
+    batch = SampleBatch(*integrator.buffer.sample(counts))
+    assert len(batch.x) == 1000
+    # fewer buffered samples than the batch size: all samples are used
+    integrator.buffer.clear(torch.tensor([True, False]))
+    assert integrator._buffered_counts().tolist() == [0, 100]
+
+
+def test_sample_batch_cat_adds_zero_counts():
+    batches = [
+        SampleBatch(torch.rand((n, 2)), None, torch.ones(n), torch.ones(n), None)
+        for n in (3, 4)
+    ]
+    batches[0].zero_counts = torch.tensor([1, 2])
+    batches[1].zero_counts = torch.tensor([3, 4])
+    cat = SampleBatch.cat(batches)
+    assert len(cat.x) == 7
+    assert cat.zero_counts.tolist() == [4, 6]
