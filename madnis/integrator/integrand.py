@@ -64,8 +64,24 @@ class Integrand(nn.Module):
                 with a channel-dependent mapping computed as part of the integrand function.
             has_channel_weight_prior: If True, the integrand returns channel weights
             channel_grouping: ChannelGrouping object or None if all channels are independent
+            function_includes_sampling: If True, the integrand function generates the sample
+                points itself instead of using the flow of the integrator. Its signature is then
+                ``c -> (x, q, f, y, alpha, c_out)`` where ``c`` are the requested channel indices,
+                ``q`` is the sampling probability of the points and ``c_out`` are the channel
+                indices of the returned points. ``y`` and ``alpha`` can be None.
+            update_active_channels_mask: function that is called with a boolean mask of shape
+                (channel_count, ) whenever channels are dropped during the training, so that the
+                integrand can disable the corresponding channels. If None, no function is called.
+            discrete_dims: number of options for each discrete dimension of the integration space.
+                The discrete dimensions are part of ``x``, encoded as integer indices.
+            discrete_dims_position: whether the discrete dimensions are the first or the last
+                dimensions of ``x``, ``"first"`` or ``"last"``
+            discrete_prior_prob_function: function that gives prior probabilities for the discrete
+                dimensions, which are multiplied with the learned probabilities. It is called with
+                the already sampled discrete dimensions, shape (n, i), and the index i of the
+                current discrete dimension, and must return unnormalized probabilities with shape
+                (n, discrete_dims[i]). If None, no prior is used.
         """
-        # TODO: update documentation
         super().__init__()
         self.input_dim = input_dim
         self.remapped_dim = input_dim if remapped_dim is None else remapped_dim
@@ -160,6 +176,14 @@ class Integrand(nn.Module):
             return self.channel_id_map[channels]
 
     def update_active_channels_mask(self, mask: torch.Tensor) -> None:
+        """
+        Passes the mask of active channels to the ``update_active_channels_mask`` function given
+        in the constructor, if it was provided. If channels are grouped, the mask is expanded from
+        channel groups to individual channels first.
+
+        Args:
+            mask: boolean tensor with shape (unique_channel_count(), ), True for active channels
+        """
         if self.update_active_channels_mask_func is None:
             return
         if self.channel_grouping is None:
@@ -176,4 +200,15 @@ class Integrand(nn.Module):
     def forward(
         self, x: torch.Tensor, channels: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """
+        Evaluates the integrand. Not supported if ``function_includes_sampling`` is True.
+
+        Args:
+            x: points in the unit hypercube, shape (n, input_dim)
+            channels: channel indices, shape (n, ), or None in the single-channel case
+        Returns:
+            Tuple ``(f, y, alpha)`` with the integrand values ``f``, shape (n, ), the remapped
+            points ``y``, shape (n, remapped_dim) or None, and the prior channel weights ``alpha``,
+            shape (n, channel_count) or None.
+        """
         return self.function(x, channels)

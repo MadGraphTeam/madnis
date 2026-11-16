@@ -9,6 +9,13 @@ from .mlp import MLP
 
 
 class DiscreteTransformer(nn.Module, Distribution):
+    """
+    Autoregressive distribution for discrete dimensions based on a transformer encoder with a
+    causal mask. Every discrete dimension is embedded as a token, and the probabilities of each
+    dimension are predicted conditional on the previous dimensions and an optional condition. Only
+    single-channel distributions are supported.
+    """
+
     def __init__(
         self,
         dims_in: list[int],
@@ -22,6 +29,24 @@ class DiscreteTransformer(nn.Module, Distribution):
         mlp_units: int = 256,
         mlp_activation: Callable[[], nn.Module] = nn.ReLU,
     ):
+        """
+        Args:
+            dims_in: number of options for each discrete dimension
+            dims_c: condition dimension
+            prior_prob_function: function that gives prior probabilities, which are multiplied
+                with the learned probabilities. It is called with the already sampled discrete
+                dimensions, shape (n, i), and the index i of the current dimension, and must return
+                unnormalized probabilities with shape (n, dims_in[i]). If None, no prior is used.
+            embedding_dim: dimension of the token embeddings
+            feedforward_dim: dimension of the feed-forward networks in the transformer layers
+            heads: number of attention heads
+            transformer_layers: number of transformer encoder layers
+            mlp_layers: number of layers of the MLP that maps the transformer output to the
+                log-probabilities
+            mlp_units: number of hidden nodes of the output MLP
+            mlp_activation: function that builds a nn.Module used as activation function of the
+                output MLP
+        """
         super().__init__()
         self.dims_in = dims_in
         self.prior_prob_function = prior_prob_function
@@ -69,6 +94,23 @@ class DiscreteTransformer(nn.Module, Distribution):
         c: torch.Tensor | None = None,
         channel: torch.Tensor | list[int] | int | None = None,
     ) -> torch.Tensor:
+        """
+        Computes the log-probabilities of the input data.
+
+        Args:
+            x: integer input data, shape (n, len(dims_in))
+            c: condition, shape (n, dims_c) or None for an unconditional flow
+            channel: encodes the channel of the samples. It must have one of the following types:
+
+                - ``Tensor``: integer tensor of shape (n, ), containing the channel index for every
+                  input sample;
+                - ``list``: list of integers, specifying the number of samples in each channel;
+                - ``int``: integer specifying a single channel containing all the samples;
+                - ``None``: used in the single-channel case or to indicate that all channels contain
+                  the same number of samples in the multi-channel case.
+        Returns:
+            log-probabilities with shape (n, )
+        """
         x_embed = F.pad(self.x_embedding(x[:, :-1]), (0, 0, 1, 0))
         pos_embed = self.pos_embedding(
             torch.arange(len(self.dims_in), device=x.device)[None, :]
@@ -102,6 +144,29 @@ class DiscreteTransformer(nn.Module, Distribution):
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """
+        Draws samples following the distribution
+
+        Args:
+            n: number of samples
+            c: condition, shape (n, dims_c) or None for an unconditional flow
+            channel: encodes the channel of the samples. It must have one of the following types:
+
+                - ``Tensor``: integer tensor of shape (n, ), containing the channel index for every
+                  input sample;
+                - ``list``: list of integers, specifying the number of samples in each channel;
+                - ``int``: integer specifying a single channel containing all the samples;
+                - ``None``: used in the single-channel case or to indicate that all channels contain
+                  the same number of samples in the multi-channel case.
+            return_log_prob: if True, also return the log-probabilities
+            return_prob: if True, also return the probabilities
+            device: device of the returned tensor. Only required if no condition is given.
+            dtype: dtype of the returned tensor. Only required if no condition is given.
+        Returns:
+            integer samples with shape (n, len(dims_in)). Depending on the arguments ``return_log_prob``,
+            ``return_prob``, this function should also return the log-probabilities with shape (n, ),
+            the probabilities with shape (n, ).
+        """
         if n is None:
             n = len(c)
         if c is not None:

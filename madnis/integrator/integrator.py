@@ -198,7 +198,10 @@ class Integrator(nn.Module):
             flow_kwargs: If flow is None, these keyword arguments are passed to the `Flow`
                 constructor.
             discrete_flow_kwargs: If flow is None, these keyword arguments are passed to the
-                ``MixedFlow`` or ``DiscreteMADE`` constructor.
+                constructor of the discrete model (``DiscreteMADE`` or ``DiscreteTransformer``).
+            discrete_model: If flow is None and the integrand has discrete dimensions, this
+                specifies the model used for them, ``"made"`` for ``DiscreteMADE`` or
+                ``"transformer"`` for ``DiscreteTransformer`` (single-channel only).
             train_channel_weights: If True, construct a channel weight network and train it. Only
                 necessary if cwnet is None.
             cwnet: network used for the trainable channel weights. If None and
@@ -1401,6 +1404,8 @@ class Integrator(nn.Module):
                 variance or uniformly. Note that weighting by mean can lead to problems for
                 non-positive functions
             channel: if different from None, samples are only generated for this channel
+            evaluate_integrand: If False, the integrand is not evaluated and the integrand values
+                and weights of the returned samples are zero.
         Returns:
             ``SampleBatch`` object, see its documentation for details
         """
