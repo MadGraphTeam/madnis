@@ -164,8 +164,11 @@ Dealing with zeros
 
 The MadNIS integrator has two parameters that control how it treats samples with an integrand value
 of zero. The parameter ``batch_size_threshold`` controls the minimum amount of samples with non-zero
-values per batch relative to the total batch size during the training. More samples are generated
-until the number is above this threshold. In addition, the parameter ``drop_zero_integrands``
+values per channel relative to the number of requested samples in that channel during the
+training. Only the channels below this threshold are sampled again, with the number of samples that
+is needed to reach it, estimated from their fraction of non-zero samples so far. To limit the cost of channels where almost all samples are cut away, at most
+``max_oversampling`` (default 100) times the requested number of samples are generated in every
+channel. In addition, the parameter ``drop_zero_integrands``
 removes samples with zero-integrand value from the optimization. It is especially useful in
 situations where the integrand evaluation is more expensive for samples with non-zero weight.
 By default (``rescale_dropped_zeros=True``), the sampling probabilities of the kept samples are

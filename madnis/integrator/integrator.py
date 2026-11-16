@@ -171,6 +171,7 @@ class Integrator(nn.Module):
         integration_history_length: int = 20,
         drop_zero_integrands: bool = False,
         batch_size_threshold: float = 0.5,
+        max_oversampling: float = 100.0,
         buffer_capacity: int = 0,
         minimum_buffer_size: int = 50,
         buffered_steps: int = 0,
@@ -225,8 +226,14 @@ class Integrator(nn.Module):
                 during the training if uniform_channel_ratio is different from one.
             drop_zero_integrands: If True, points with integrand zero are dropped and not used for
                 the optimization. See also ``rescale_dropped_zeros``.
-            batch_size_threshold: New samples are drawn until the number of samples is at least
-                batch_size_threshold * batch_size.
+            batch_size_threshold: During training, new samples are drawn until the number of
+                samples with non-zero integrand is at least batch_size_threshold times the
+                number of requested samples in every channel. Only the channels below this
+                threshold are sampled again, with the number of samples that is needed to reach
+                it, estimated from their fraction of non-zero integrand values.
+            max_oversampling: maximal number of samples drawn for a channel in one training step
+                in units of the number of requested samples for that channel. This limits the
+                cost of channels with a very small fraction of non-zero integrand values.
             buffer_capacity: number of samples that are stored for buffered training in every
                 channel
             minimum_buffer_size: minimal total number of buffered samples, summed over all
@@ -421,6 +428,7 @@ class Integrator(nn.Module):
         self.rescale_dropped_zeros = rescale_dropped_zeros
         self.grad_clip_threshold = grad_clip_threshold or None
         self.batch_size_threshold = batch_size_threshold
+        self.max_oversampling = max_oversampling
         if loss is None:
             self.loss = stratified_variance if self.multichannel else kl_divergence
         else:
@@ -1061,6 +1069,126 @@ class Integrator(nn.Module):
         )
         return samples
 
+    def _sample_batch(
+        self, counts: torch.Tensor, evaluate_integrand: bool = True
+    ) -> SampleBatch:
+        """
+        Draws samples from the flow and evaluates the integrand for a given number of samples in
+        every channel.
+
+        Args:
+            counts: number of samples for every integration channel, shape (channels, )
+            evaluate_integrand: If False, the integrand is not evaluated and weight, y and
+                alphas_prior are set to dummy values.
+        Returns:
+            Object containing a batch of samples, ordered by channel
+        """
+        n = int(counts.sum().item())
+        batch_channels = (
+            torch.repeat_interleave(
+                torch.arange(len(counts), device=self.dummy.device), counts
+            )
+            if self.multichannel
+            else None
+        )
+        integration_channels = None
+        weight_factor = None
+        if self.integrand.function_includes_sampling:
+            integration_channels = batch_channels
+            x, prob, weight, y, alphas_prior, channels = self.integrand.function(
+                batch_channels
+            )
+            self._check_integrand_output(x, weight, alphas_prior)
+        else:
+            if self.group_channels and self.group_channels_uniform:
+                group_sizes = self.channel_group_sizes[batch_channels]
+                chan_in_group = (
+                    torch.rand((n,), device=self.dummy.device, dtype=self.dummy.dtype)
+                    * group_sizes
+                ).long()
+                weight_factor = group_sizes
+                integration_channels = batch_channels
+                channels = self.channel_group_remap[batch_channels, chan_in_group]
+            else:
+                channels = batch_channels
+
+            with torch.no_grad():
+                x, prob = self.flow.sample(
+                    n,
+                    channel=channels,
+                    return_prob=True,
+                    device=self.dummy.device,
+                    dtype=self.dummy.dtype,
+                )
+            valid_channels = None
+            if self.group_channels and not self.group_channels_uniform:
+                integration_channels = batch_channels
+                channels, valid_channels = self._learned_group_channels(
+                    x, batch_channels
+                )
+            if evaluate_integrand:
+                weight, y, alphas_prior = self.integrand(x, channels)
+                self._check_integrand_output(x, weight, alphas_prior)
+                if valid_channels is not None:
+                    weight = torch.where(
+                        valid_channels, weight, torch.zeros_like(weight)
+                    )
+            else:
+                weight = torch.zeros((x.shape[0]), device=x.device, dtype=x.dtype)
+                y = None
+                alphas_prior = None
+
+        if weight_factor is not None:
+            weight *= weight_factor
+        return SampleBatch(
+            x,
+            y,
+            prob,
+            weight,
+            channels,
+            alphas_prior,
+            integration_channels=integration_channels,
+        )
+
+    def _missing_counts(
+        self,
+        target_counts: torch.Tensor,
+        generated_counts: torch.Tensor,
+        nonzero_counts: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Determines how many additional samples have to be drawn in every channel during the
+        training. Channels with fewer than ``batch_size_threshold`` times the requested number of
+        samples with non-zero integrand are sampled again. The number of new samples is estimated
+        from the fraction of non-zero samples in that channel so far, such that the missing
+        number of non-zero samples is reached with a margin of two standard deviations. This
+        makes further sampling rounds unlikely. If there is no non-zero sample yet, the number of
+        samples in the channel is doubled. In total, at most
+        ``max_oversampling`` times the requested number of samples are drawn per channel.
+
+        Args:
+            target_counts: requested number of samples per channel, shape (channels, )
+            generated_counts: number of samples drawn so far per channel, shape (channels, )
+            nonzero_counts: number of samples with non-zero integrand per channel, shape
+                (channels, )
+        Returns:
+            number of samples to draw per channel, shape (channels, )
+        """
+        target = target_counts.double()
+        generated = generated_counts.double()
+        nonzero = nonzero_counts.double()
+        required = self.batch_size_threshold * target
+        below_threshold = nonzero < required
+        missing = (required - nonzero).clip(min=0)
+        expected = torch.where(
+            nonzero > 0,
+            (missing + 2 * missing.sqrt()) * generated / nonzero.clip(min=1),
+            generated,
+        )
+        budget = torch.floor(self.max_oversampling * target) - generated
+        counts = torch.minimum(torch.ceil(expected), budget).clip(min=0)
+        return torch.where(below_threshold, counts, 0).long()
+
     def _get_samples(
         self,
         n: int,
@@ -1071,7 +1199,8 @@ class Integrator(nn.Module):
         evaluate_integrand: bool = True,
     ) -> SampleBatch:
         """
-        Draws samples from the flow and evaluates the integrand
+        Draws samples from the flow and evaluates the integrand. In training mode, channels with
+        too few samples with non-zero integrand are sampled again, see ``_missing_counts``.
 
         Args:
             n: number of samples
@@ -1087,110 +1216,46 @@ class Integrator(nn.Module):
         Returns:
             Object containing a batch of samples
         """
-        if channel is None:
-            batch_channels = (
-                self._get_channels(
-                    n,
-                    self._get_channel_contributions(train, channel_weight_mode),
-                    uniform_channel_ratio,
-                )
-                if self.multichannel
-                else None
+        n_channels = self.integration_channel_count or 1
+        if channel is not None:
+            target_counts = torch.zeros(
+                (n_channels,), dtype=torch.int64, device=self.dummy.device
+            )
+            target_counts[channel] = n
+        elif self.multichannel:
+            target_counts = self._get_channels(
+                n,
+                self._get_channel_contributions(train, channel_weight_mode),
+                uniform_channel_ratio,
+                return_counts=True,
             )
         else:
-            batch_channels = torch.full((n,), channel, device=self.dummy.device)
+            target_counts = torch.full((1,), n, device=self.dummy.device)
 
         batches_out = []
-        current_batch_size = 0
+        request_counts = target_counts
+        generated_counts = torch.zeros_like(target_counts)
+        nonzero_counts = torch.zeros_like(target_counts)
         while True:
-            integration_channels = None
-            weight_factor = None
-            if self.integrand.function_includes_sampling:
-                integration_channels = batch_channels
-                x, prob, weight, y, alphas_prior, channels = self.integrand.function(
-                    batch_channels
-                )
-                self._check_integrand_output(x, weight, alphas_prior)
-            else:
-                if self.group_channels and self.group_channels_uniform:
-                    group_sizes = self.channel_group_sizes[batch_channels]
-                    chan_in_group = (
-                        torch.rand(
-                            (n,), device=self.dummy.device, dtype=self.dummy.dtype
-                        )
-                        * group_sizes
-                    ).long()
-                    weight_factor = group_sizes
-                    integration_channels = batch_channels
-                    channels = self.channel_group_remap[batch_channels, chan_in_group]
-                else:
-                    channels = batch_channels
+            batch = self._sample_batch(request_counts, evaluate_integrand)
+            if not train or not evaluate_integrand:
+                batches_out.append(batch)
+                break
 
-                with torch.no_grad():
-                    x, prob = self.flow.sample(
-                        n,
-                        channel=channels,
-                        return_prob=True,
-                        device=self.dummy.device,
-                        dtype=self.dummy.dtype,
-                    )
-                valid_channels = None
-                if self.group_channels and not self.group_channels_uniform:
-                    integration_channels = batch_channels
-                    channels, valid_channels = self._learned_group_channels(
-                        x, batch_channels
-                    )
-                if evaluate_integrand:
-                    weight, y, alphas_prior = self.integrand(x, channels)
-                    self._check_integrand_output(x, weight, alphas_prior)
-                    if valid_channels is not None:
-                        weight = torch.where(
-                            valid_channels, weight, torch.zeros_like(weight)
-                        )
-                else:
-                    weight = torch.zeros((x.shape[0]), device=x.device, dtype=x.dtype)
-                    y = None
-                    alphas_prior = None
-
-            if weight_factor is not None:
-                weight *= weight_factor
-            batch = SampleBatch(
-                x,
-                y,
-                prob,
-                weight,
-                channels,
-                alphas_prior,
-                integration_channels=integration_channels,
-            )
-
-            if not train:
-                current_batch_size += batch.x.shape[0]
-            elif self.drop_zero_integrands:
-                mask = weight != 0.0
-                batch = batch.map(lambda t: t[mask])
-                if self.multichannel:
-                    batch.zero_counts = torch.bincount(
-                        (
-                            channels[~mask]
-                            if integration_channels is None
-                            else integration_channels[~mask]
-                        ),
-                        minlength=self.integration_channel_count,
-                    )
-                else:
-                    batch.zero_counts = torch.full(
-                        (1,), torch.count_nonzero(~mask), device=x.device
-                    )
-                current_batch_size += batch.x.shape[0]
-            else:
-                current_batch_size += weight.count_nonzero()
-
-            # mask = ~(weight.isnan() | x.isnan().any(dim=1)) & mask
+            channels = self._batch_channels(batch)
+            nonzero = batch.func_vals != 0
+            generated_counts += torch.bincount(channels, minlength=n_channels)
+            nonzero_counts += torch.bincount(channels[nonzero], minlength=n_channels)
+            if self.drop_zero_integrands:
+                zero_counts = torch.bincount(channels[~nonzero], minlength=n_channels)
+                batch = batch.map(lambda t: t[nonzero])
+                batch.zero_counts = zero_counts
             batches_out.append(batch)
 
-            # check this condition at the end such that the sampling runs at least once
-            if current_batch_size > self.batch_size_threshold * n:
+            request_counts = self._missing_counts(
+                target_counts, generated_counts, nonzero_counts
+            )
+            if request_counts.sum().item() == 0:
                 break
 
         samples = SampleBatch.cat(batches_out)

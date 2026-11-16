@@ -164,3 +164,71 @@ def test_vegas_buffer_with_dropped_zeros():
     assert abs(weights.mean().item() - reference_integral()) < 5 * error
     # without rescaling, the mean weight would be too large by the inverse acceptance
     assert len(weights) < 0.8 * n_generated
+
+
+def channel_cut_integrand(efficiency_1: float) -> "Integrand":
+    """two channels, channel 1 has the given fraction of non-zero integrand values"""
+    from madnis.integrator import Integrand
+
+    def function(x, channels):
+        keep = (channels == 0) | (x[:, 0] < efficiency_1)
+        return (1 + x[:, 1]) * keep
+
+    return Integrand(function, input_dim=2, channel_count=2)
+
+
+def test_missing_counts():
+    integrator = Integrator(
+        channel_cut_integrand(0.5),
+        batch_size_threshold=0.5,
+        max_oversampling=10,
+        dtype=torch.float64,
+    )
+    missing = integrator._missing_counts(
+        target_counts=torch.tensor([100, 100, 100, 100, 0]),
+        generated_counts=torch.tensor([100, 100, 100, 950, 0]),
+        nonzero_counts=torch.tensor([60, 20, 0, 1, 0]),
+    )
+    # above threshold: nothing; 20% efficiency: (30 missing + 2 sqrt(30)) / 0.2;
+    # no non-zero sample yet: doubled; budget of 1000 samples: 50 left; empty: nothing
+    assert missing.tolist() == [0, 205, 100, 50, 0]
+
+
+@pytest.mark.parametrize("drop_zeros", [True, False])
+def test_resampling_only_in_channels_with_missing_samples(drop_zeros):
+    """only the channel with a low fraction of non-zero samples is sampled again"""
+    torch.manual_seed(0)
+    integrator = Integrator(
+        channel_cut_integrand(0.1),
+        batch_size_threshold=0.5,
+        drop_zero_integrands=drop_zeros,
+        dtype=torch.float64,
+    )
+    samples = integrator._get_samples(2048, uniform_channel_ratio=1.0, train=True)
+    nonzero = samples.func_vals != 0
+    nonzero_counts = torch.bincount(samples.channels[nonzero], minlength=2)
+    if drop_zeros:
+        generated = torch.bincount(samples.channels, minlength=2) + samples.zero_counts
+    else:
+        generated = torch.bincount(samples.channels, minlength=2)
+    # channel 0 has no zeros and is sampled only once
+    assert generated[0] == 1024
+    # channel 1 is filled up to at least half of its requested samples, and the number of
+    # generated samples stays close to the expected 512 / 0.1
+    assert nonzero_counts[1] >= 512
+    assert 4000 < generated[1] < 8000
+
+
+def test_resampling_stops_for_empty_channel():
+    """a channel without any non-zero samples is sampled at most max_oversampling times"""
+    torch.manual_seed(0)
+    integrator = Integrator(
+        channel_cut_integrand(0.0),
+        drop_zero_integrands=True,
+        max_oversampling=8,
+        dtype=torch.float64,
+    )
+    samples = integrator._get_samples(1024, uniform_channel_ratio=1.0, train=True)
+    assert (samples.channels == 0).sum() == 512
+    assert (samples.channels == 1).sum() == 0
+    assert samples.zero_counts.tolist() == [0, 8 * 512]
