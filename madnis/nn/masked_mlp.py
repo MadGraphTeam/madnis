@@ -103,8 +103,8 @@ class MaskedMLP(nn.Module):
 
     def reset_parameters(self):
         """
-        Initializes the hidden layers like ``nn.Linear`` and the last layer with zeros, so that
-        the network output is zero after initialization.
+        Initializes all layers except the last one like ``nn.Linear`` and the last layer with
+        zeros, so that the network output is zero after initialization.
         """
         for chan_weights, chan_biases in zip(self.weights, self.biases):
             for weight, bias in zip(chan_weights[:-1], chan_biases[:-1]):
@@ -132,7 +132,8 @@ class MaskedMLP(nn.Module):
                 - ``list``: list of integers, specifying the number of samples in each channel;
                 - ``int``: integer specifying a single channel containing all the samples;
                 - ``None``: used in the single-channel case or to indicate that all channels
-                  contain the same number of samples in the multi-channel case.
+                  contain the same number of samples in the multi-channel case. In that case,
+                  ``n`` must be divisible by the number of channels.
         Returns:
             network output, shape (n, sum(output_dims))
         """
@@ -153,7 +154,7 @@ class MaskedMLP(nn.Module):
             return torch.cat(
                 [
                     self._forward_single(xi, i)
-                    for i, xi in enumerate(x.split(x.shape[0] // self.channels, dim=0))
+                    for i, xi in enumerate(x.split(self._uniform_split_size(x), dim=0))
                 ],
                 dim=0,
             )
@@ -180,7 +181,8 @@ class MaskedMLP(nn.Module):
                 - ``list``: list of integers, specifying the number of samples in each channel;
                 - ``int``: integer specifying a single channel containing all the samples;
                 - ``None``: used in the single-channel case or to indicate that all channels
-                  contain the same number of samples in the multi-channel case.
+                  contain the same number of samples in the multi-channel case. In that case,
+                  ``n`` must be divisible by the number of channels.
         Returns:
             Tuple with the output block, shape (n, output_dims[feature]), and the updated caches
         """
@@ -209,11 +211,19 @@ class MaskedMLP(nn.Module):
                 *[
                     self._forward_cached_single(xi, feature, cache, i)
                     for i, (xi, cache) in enumerate(
-                        zip(x.split(x.shape[0] // self.channels, dim=0), caches)
+                        zip(x.split(self._uniform_split_size(x), dim=0), caches)
                     )
                 ]
             )
             return torch.cat(xs, dim=0), caches
+
+    def _uniform_split_size(self, x: torch.Tensor) -> int:
+        if x.shape[0] % self.channels != 0:
+            raise ValueError(
+                f"With channel=None, the number of samples ({x.shape[0]}) must be divisible "
+                f"by the number of channels ({self.channels})"
+            )
+        return x.shape[0] // self.channels
 
     def _forward_single(self, x: torch.Tensor, channel: int) -> torch.Tensor:
         weights, biases = self.weights[channel], self.biases[channel]

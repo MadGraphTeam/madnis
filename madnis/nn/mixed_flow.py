@@ -121,7 +121,7 @@ class MixedFlow(nn.Module, Distribution):
         Computes the log-probabilities of the input data.
 
         Args:
-            x: input data, shape (n, dims_in)
+            x: input data, shape (n, dims_in_continuous + len(dims_in_discrete))
             c: condition, shape (n, dims_c) or None for an unconditional flow
             channel: encodes the channel of the samples. It must have one of the following types:
 
@@ -187,9 +187,9 @@ class MixedFlow(nn.Module, Distribution):
             device: device of the returned tensor. Only required if no condition is given.
             dtype: dtype of the returned tensor. Only required if no condition is given.
         Returns:
-            samples with shape (n, dims_in). Depending on the arguments ``return_log_prob``,
-            ``return_prob``, this function should also return the log-probabilities with shape (n, ),
-            the probabilities with shape (n, ).
+            samples with shape (n, dims_in_continuous + len(dims_in_discrete)). Depending on the
+            arguments ``return_log_prob``, ``return_prob``, this function should also return the
+            log-probabilities with shape (n, ), the probabilities with shape (n, ).
         """
         if self.discrete_dims_first:
             x_discrete, prob_discrete = self.discrete_flow.sample(

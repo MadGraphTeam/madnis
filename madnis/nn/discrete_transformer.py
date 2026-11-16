@@ -100,17 +100,13 @@ class DiscreteTransformer(nn.Module, Distribution):
         Args:
             x: integer input data, shape (n, len(dims_in))
             c: condition, shape (n, dims_c) or None for an unconditional flow
-            channel: encodes the channel of the samples. It must have one of the following types:
-
-                - ``Tensor``: integer tensor of shape (n, ), containing the channel index for every
-                  input sample;
-                - ``list``: list of integers, specifying the number of samples in each channel;
-                - ``int``: integer specifying a single channel containing all the samples;
-                - ``None``: used in the single-channel case or to indicate that all channels contain
-                  the same number of samples in the multi-channel case.
+            channel: only present for compatibility with the ``Distribution`` interface. Must be
+                None, as only single-channel distributions are supported.
         Returns:
             log-probabilities with shape (n, )
         """
+        if channel is not None:
+            raise ValueError("DiscreteTransformer only supports channel=None")
         x_embed = F.pad(self.x_embedding(x[:, :-1]), (0, 0, 1, 0))
         pos_embed = self.pos_embedding(
             torch.arange(len(self.dims_in), device=x.device)[None, :]
@@ -150,14 +146,8 @@ class DiscreteTransformer(nn.Module, Distribution):
         Args:
             n: number of samples
             c: condition, shape (n, dims_c) or None for an unconditional flow
-            channel: encodes the channel of the samples. It must have one of the following types:
-
-                - ``Tensor``: integer tensor of shape (n, ), containing the channel index for every
-                  input sample;
-                - ``list``: list of integers, specifying the number of samples in each channel;
-                - ``int``: integer specifying a single channel containing all the samples;
-                - ``None``: used in the single-channel case or to indicate that all channels contain
-                  the same number of samples in the multi-channel case.
+            channel: only present for compatibility with the ``Distribution`` interface. Must be
+                None, as only single-channel distributions are supported.
             return_log_prob: if True, also return the log-probabilities
             return_prob: if True, also return the probabilities
             device: device of the returned tensor. Only required if no condition is given.
@@ -167,6 +157,8 @@ class DiscreteTransformer(nn.Module, Distribution):
             ``return_prob``, this function should also return the log-probabilities with shape (n, ),
             the probabilities with shape (n, ).
         """
+        if channel is not None:
+            raise ValueError("DiscreteTransformer only supports channel=None")
         if n is None:
             n = len(c)
         if c is not None:

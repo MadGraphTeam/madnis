@@ -231,6 +231,22 @@ def test_channel_grouping_sample_weights(grouping_mode):
     assert_weights_unbiased(samples.weights, TWO_PEAKS_INTEGRAL)
 
 
+@pytest.mark.parametrize("grouping_mode", ["none", "uniform"])
+def test_active_channels_mask_ungrouped(grouping_mode):
+    """the mask passed to the integrand always has one entry per channel"""
+    integrator = Integrator(grouped_integrand(), channel_grouping_mode=grouping_mode)
+    if grouping_mode == "none":
+        integrator.active_channels_mask[:] = torch.tensor([True, False, True, False])
+    else:
+        integrator.active_channels_mask[:] = torch.tensor([True, False])
+    assert integrator._active_channels_mask_ungrouped().tolist() == [
+        True,
+        False,
+        True,
+        False,
+    ]
+
+
 def test_channel_dropping():
     """a channel with a negligible contribution is dropped"""
 
