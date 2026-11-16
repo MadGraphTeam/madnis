@@ -30,6 +30,10 @@ vegas = ["vegas"]
 line-length = 88
 target-version = ["py311"]
 
+[tool.pytest.ini_options]
+# the tutorial code in docs/ is tested separately with "pytest docs"
+testpaths = ["tests"]
+
 [tool.coverage.run]
 source = ["madnis"]
 
