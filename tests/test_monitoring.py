@@ -1,6 +1,7 @@
 """Tests for the training status, the training statistics and the status printer (issue #7)"""
 
 import io
+from dataclasses import astuple
 
 import pytest
 import torch
@@ -99,11 +100,13 @@ def test_status_independent_of_dropping(drop_zero_integrands, rescale_dropped_ze
         reference.integration.integral, rel=1e-12
     )
     assert status.integration.channel_counts == reference.integration.channel_counts
-    assert status.unweighting == pytest.approx(reference.unweighting, rel=1e-12)
+    assert astuple(status.unweighting) == pytest.approx(
+        astuple(reference.unweighting), rel=1e-12
+    )
     for channel, (metrics, metrics_reference) in enumerate(
         zip(status.channel_unweighting, reference.channel_unweighting)
     ):
-        assert metrics == pytest.approx(metrics_reference, rel=1e-12)
+        assert astuple(metrics) == pytest.approx(astuple(metrics_reference), rel=1e-12)
         assert metrics.cut_eff == pytest.approx(
             status.channel_nonzero_counts[channel]
             / status.channel_sample_counts[channel]
