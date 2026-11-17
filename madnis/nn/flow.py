@@ -260,19 +260,18 @@ class Flow(nn.Module, Distribution):
 
         if dims_in == 1:
             if condition_masks.shape[1] == 1:
-                self.condition_masks = torch.zeros_like(
-                    condition_masks, dtype=torch.bool
-                )
+                condition_masks = torch.zeros_like(condition_masks, dtype=torch.bool)
             else:
-                self.condition_masks = torch.zeros((1, 1), dtype=torch.bool)
-        else:
-            self.condition_masks = condition_masks
+                condition_masks = torch.zeros((1, 1), dtype=torch.bool)
+        # registered as a buffer to move with the flow, but not part of the state dict to keep
+        # it compatible with older checkpoints
+        self.register_buffer("condition_masks", condition_masks, persistent=False)
 
         self.subnets = nn.ModuleList()
         # needed to get one fake dim when 1D only
         dim1 = 1 if self.dims_in == 1 else 0
         for mask in self.condition_masks:
-            dims_cond = torch.count_nonzero(mask)
+            dims_cond = int(torch.count_nonzero(mask))
             self.subnets.append(
                 subnet_constructor(
                     dims_cond + dims_c + dim1,

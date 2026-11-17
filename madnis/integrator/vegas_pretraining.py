@@ -1,9 +1,9 @@
+import math
 import signal
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
-import numpy as np
 import torch
 
 from .integrator import Integrator, SampleBatch
@@ -13,6 +13,7 @@ from .metrics import (
     integration_metrics,
     unweighting_metrics,
 )
+from .vegas_grid import VegasGrid
 
 
 @dataclass
@@ -53,10 +54,6 @@ class VegasPreTraining:
             bins: number of VEGAS grid bins per dimension
             damping: damping parameter (``alpha`` in the vegas package) of the grid adaptation
         """
-        import vegas  # vegas module is optional dependency, so import locally
-
-        # TODO: also maybe replace this with our own VEGAS implementation in pytorch?
-
         self.integrator = integrator
         self.integrand = integrator.integrand
         self.damping = damping
@@ -74,14 +71,55 @@ class VegasPreTraining:
                 ]
         else:
             self.grid_channels = [[0]]
-        self.grids = [
-            vegas.AdaptiveMap(grid=[[0, 1]] * self.input_dim, ninc=bins)
-            for _ in self.grid_channels
-        ]
-        self.rng = np.random.default_rng()
+        self.grids = VegasGrid(
+            len(self.grid_channels),
+            self.input_dim,
+            bins,
+            device=self.integrator.dummy.device,
+        )
         self.step = 0
 
-    def _map_discrete(self, x: torch.Tensor, jac: np.array) -> torch.Tensor:
+    def _channel_weight(
+        self,
+        func_vals: torch.Tensor,
+        channels: torch.Tensor,
+        alphas: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """
+        Returns the channel weight of the sampled channel. Without prior channel weights, the
+        channel weights are uniform, as in the integrator without channel weight network.
+        """
+        if alphas is None:
+            return torch.full_like(func_vals, 1 / self.integrand.channel_count)
+        return torch.gather(alphas, index=channels[:, None], dim=1)[:, 0]
+
+    def _draw(
+        self, grid_index: int, n: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Draws points from a VEGAS grid on the device of the integrator.
+
+        Returns:
+            tuple of the random numbers with shape (n, input_dim), the mapped points in the
+            data type of the integrator and the Jacobians in double precision
+        """
+        self.grids.to(self.integrator.dummy.device)
+        r = torch.rand(
+            (n, self.input_dim), dtype=torch.float64, device=self.grids.device
+        )
+        x, jac = self.grids.map(grid_index, r)
+        x, jac = self._map_discrete(x.to(self.integrator.dummy.dtype), jac)
+        return r, x, jac
+
+    def _random_channels(self, grid_channels: list[int], n: int) -> torch.Tensor:
+        """Draws channels uniformly from the channels of a grid"""
+        device = self.integrator.dummy.device
+        choices = torch.tensor(grid_channels, device=device)
+        return choices[torch.randint(len(grid_channels), (n,), device=device)]
+
+    def _map_discrete(
+        self, x: torch.Tensor, jac: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         disc_dims = len(self.integrand.discrete_dims)
         disc_dims_vec = torch.tensor(self.integrand.discrete_dims, device=x.device)
         if disc_dims == 0:
@@ -99,7 +137,7 @@ class VegasPreTraining:
             x_disc = x[:, -disc_dims:]
             x_cont = x[:, :-disc_dims]
             x_ret = torch.cat([x_cont, map_disc(x_disc)], dim=1)
-        return x_ret, jac * np.prod(self.integrand.discrete_dims)
+        return x_ret, jac * math.prod(self.integrand.discrete_dims)
 
     def train_step(self, samples_per_channel: int) -> VegasTrainingStatus:
         """
@@ -115,20 +153,14 @@ class VegasPreTraining:
             if self.integrator.multichannel
             else 1
         )
-        variances = torch.zeros(n_channels)
-        counts = torch.zeros(n_channels)
-        means = torch.zeros(n_channels)
+        device = self.integrator.dummy.device
+        dtype = self.integrator.dummy.dtype
+        variances = torch.zeros(n_channels, dtype=torch.float64, device=device)
+        counts = torch.zeros(n_channels, dtype=torch.float64, device=device)
+        means = torch.zeros(n_channels, dtype=torch.float64, device=device)
         # TODO: maybe implement stratified training instead of uniform channels
-        for grid_index, (grid, grid_channels) in enumerate(
-            zip(self.grids, self.grid_channels)
-        ):
-            x = np.empty((samples_per_channel, self.input_dim), float)
-            jac = np.empty(samples_per_channel, float)
-
-            r = self.rng.random((samples_per_channel, self.input_dim))
-            grid.map(r, x, jac)
-            x_torch = torch.as_tensor(x, dtype=self.integrator.dummy.dtype)
-            x_torch, jac = self._map_discrete(x_torch, jac)
+        for grid_index, grid_channels in enumerate(self.grid_channels):
+            r, x, jac = self._draw(grid_index, samples_per_channel)
 
             valid_channels = None
             if (
@@ -137,101 +169,109 @@ class VegasPreTraining:
             ):
                 # the channel within the group is given by a discrete dimension
                 channels, valid_channels = self.integrator._learned_group_channels(
-                    x_torch, torch.full((samples_per_channel,), grid_index)
+                    x, torch.full((samples_per_channel,), grid_index, device=device)
                 )
             elif self.integrator.multichannel:
                 # TODO: no need for random numbers here
-                channels = torch.from_numpy(
-                    self.rng.choice(grid_channels, (samples_per_channel,))
-                )
+                channels = self._random_channels(grid_channels, samples_per_channel)
             else:
                 channels = None
 
-            func_vals, y, alphas = self.integrand(x_torch, channels)
-            self.integrator._check_integrand_output(x_torch, func_vals, alphas)
+            func_vals, y, alphas = self.integrand(x, channels)
+            self.integrator._check_integrand_output(x, func_vals, alphas)
             if valid_channels is not None:
                 func_vals = torch.where(
                     valid_channels, func_vals, torch.zeros_like(func_vals)
                 )
 
+            f = jac * func_vals
             if self.integrator.multichannel:
-                alpha = torch.gather(alphas, index=channels[:, None], dim=1)[:, 0]
-                f = jac * func_vals.numpy() * alpha.numpy()
-            else:
-                f = jac * func_vals.numpy()
+                f = f * self._channel_weight(func_vals, channels, alphas)
             if self.integrator.drop_zero_integrands:
-                mask_np = f != 0.0
-                f = f[mask_np]
-                r = r[mask_np]
-                jac = jac[mask_np]
-                mask_torch = torch.as_tensor(mask_np)
+                mask = f != 0.0
+                zero_count = torch.count_nonzero(~mask)
                 if self.integrator.group_channels:
                     zero_counts = torch.zeros(
-                        (self.integrator.integration_channel_count,), dtype=torch.int64
+                        (self.integrator.integration_channel_count,),
+                        dtype=torch.int64,
+                        device=device,
                     )
-                    zero_counts[grid_index] = torch.count_nonzero(~mask_torch)
-                    channels = channels[mask_torch]
-                    alphas = alphas[mask_torch]
+                    zero_counts[grid_index] = zero_count
                 elif self.integrator.multichannel:
                     zero_counts = torch.bincount(
-                        channels[~mask_torch], minlength=self.integrand.channel_count
+                        channels[~mask], minlength=self.integrand.channel_count
                     )
-                    channels = channels[mask_torch]
-                    alphas = alphas[mask_torch]
                 else:
-                    zero_counts = torch.full((1,), torch.count_nonzero(~mask_torch))
-                x_torch = x_torch[mask_torch]
-                y = None if y is None else y[mask_torch]
-                func_vals = func_vals[mask_torch]
+                    zero_counts = zero_count[None]
+                if self.integrator.multichannel:
+                    channels = channels[mask]
+                    alphas = None if alphas is None else alphas[mask]
+                f = f[mask]
+                r = r[mask]
+                jac = jac[mask]
+                x = x[mask]
+                y = None if y is None else y[mask]
+                func_vals = func_vals[mask]
             else:
                 zero_counts = None
-            grid.add_training_data(r, f**2)
-            grid.adapt(alpha=self.damping)
+            self.grids.add_training_data(grid_index, r, f.square())
+            self.grids.adapt(grid_index, self.damping)
 
             if self.integrator.group_channels:
                 integration_channels = torch.full_like(channels, grid_index)
-                if self.integrator.group_channels_uniform:
-                    f_chan = torch.from_numpy(f) * len(grid_channels)
-                else:
-                    f_chan = torch.from_numpy(f)
-                counts_chan = len(f_chan)
-                if zero_counts is not None:
-                    counts_chan += zero_counts[grid_index]
-                means_chan = f_chan.sum() / counts_chan
+                f_chan = (
+                    f * len(grid_channels)
+                    if self.integrator.group_channels_uniform
+                    else f
+                )
+                counts_chan = len(f_chan) + (
+                    0 if zero_counts is None else zero_counts[grid_index]
+                )
+                means[grid_index] = f_chan.sum() / counts_chan
                 counts[grid_index] = counts_chan
-                means[grid_index] = means_chan
                 variances[grid_index] = (
-                    f_chan - means_chan
+                    f_chan - means[grid_index]
                 ).square().sum() / counts_chan
             else:
                 integration_channels = None
-                for chan in grid_channels:
-                    f_chan = torch.from_numpy(f)
-                    if self.integrator.multichannel:
-                        f_chan = f_chan[channels == chan]
-                    counts_chan = len(f_chan)
-                    if zero_counts is not None:
-                        counts_chan += zero_counts[chan]
-                    counts[chan] = counts_chan
-                    means[chan] = f_chan.sum() / counts_chan
-                    variances[chan] = (
-                        f_chan - means[chan]
-                    ).square().sum() / counts_chan
+                # one grid can contain several channels if they are grouped, but integrated
+                # separately (channel_grouping_mode="none")
+                index = (
+                    channels
+                    if self.integrator.multichannel
+                    else torch.zeros_like(f, dtype=torch.int64)
+                )
+                counts_all = torch.bincount(index, minlength=n_channels).double()
+                if zero_counts is not None:
+                    counts_all += zero_counts
+                means_all = (
+                    torch.bincount(index, weights=f, minlength=n_channels) / counts_all
+                )
+                variances_all = (
+                    torch.bincount(
+                        index,
+                        weights=(f - means_all[index]).square(),
+                        minlength=n_channels,
+                    )
+                    / counts_all
+                )
+                chans = torch.tensor(grid_channels, device=device)
+                counts[chans] = counts_all[chans]
+                means[chans] = means_all[chans]
+                variances[chans] = variances_all[chans]
 
             stored_samples = SampleBatch(
-                x_torch,
+                x,
                 y,
-                torch.from_numpy(1 / jac),
+                (1 / jac).to(dtype),
                 func_vals,
                 channels,
                 alphas,
                 integration_channels=integration_channels,
-            ).map(lambda t: t.to(self.integrator.dummy.device))
+            )
             if zero_counts is not None:
                 # same rescaling of the sampling probabilities as for the online samples
-                stored_samples.zero_counts = zero_counts.to(
-                    self.integrator.dummy.device
-                )
+                stored_samples.zero_counts = zero_counts
                 stored_samples = self.integrator._rescale_dropped(stored_samples)
             self.integrator._store_samples(stored_samples)
         self.integrator.integration_history.store(
@@ -287,19 +327,11 @@ class VegasPreTraining:
         """
         Initializes the flows in the integrator object using the trained VEGAS grid
         """
-        grids_torch = [
-            torch.as_tensor(
-                grid.extract_grid(),
-                device=self.integrator.dummy.device,
-                dtype=self.integrator.dummy.dtype,
-            )
-            for grid in self.grids
-        ]
-        grids = (
-            torch.stack(grids_torch, dim=0)
-            if self.integrator.multichannel
-            else grids_torch[0]
+        grids = self.grids.grid.to(
+            device=self.integrator.dummy.device, dtype=self.integrator.dummy.dtype
         )
+        if not self.integrator.multichannel:
+            grids = grids[0]
         disc_dims = len(self.integrand.discrete_dims)
         if disc_dims > 0:
             if self.integrand.discrete_dims_position == "first":
@@ -333,6 +365,8 @@ class VegasPreTraining:
         Returns:
             ``SampleBatch`` object, see its documentation for details
         """
+        device = self.integrator.dummy.device
+        dtype = self.integrator.dummy.dtype
         if channel is None and self.integrator.multichannel:
             if channel_weight_mode == "uniform":
                 uniform_channel_ratio = 1.0
@@ -346,27 +380,23 @@ class VegasPreTraining:
                 n, channel_weights, uniform_channel_ratio
             )
         else:
-            samples_per_channel = torch.zeros((len(self.grids),), dtype=torch.int64)
+            samples_per_channel = torch.zeros(
+                (len(self.grid_channels),), dtype=torch.int64, device="cpu"
+            )
             samples_per_channel[channel] = n
+        # the sample counts determine tensor shapes, so move them to the CPU once
+        samples_per_channel = samples_per_channel.cpu()
 
         samples = []
-        for grid_index, (grid, grid_channels) in enumerate(
-            zip(self.grids, self.grid_channels)
-        ):
-            n_samples = (
+        for grid_index, grid_channels in enumerate(self.grid_channels):
+            n_samples = int(
                 samples_per_channel[grid_index]
                 if self.integrator.group_channels
                 else samples_per_channel[grid_channels].sum()
             )
             if n_samples == 0:
                 continue
-            x = np.empty((n_samples, self.input_dim), float)
-            jac = np.empty(n_samples, float)
-
-            r = self.rng.random((n_samples, self.input_dim))
-            grid.map(r, x, jac)
-            x_torch = torch.as_tensor(x, dtype=self.integrator.dummy.dtype)
-            x_torch, jac = self._map_discrete(x_torch, jac)
+            _, x_torch, jac = self._draw(grid_index, n_samples)
             integration_channels = None
             valid_channels = None
             if (
@@ -374,19 +404,25 @@ class VegasPreTraining:
                 and not self.integrator.group_channels_uniform
             ):
                 # the channel within the group is given by a discrete dimension
-                integration_channels = torch.full((n_samples,), grid_index)
+                integration_channels = torch.full(
+                    (n_samples,), grid_index, device=device
+                )
                 channels, valid_channels = self.integrator._learned_group_channels(
                     x_torch, integration_channels
                 )
             elif self.integrator.group_channels:
-                channels = torch.from_numpy(
-                    self.rng.choice(grid_channels, (n_samples,))
+                channels = self._random_channels(grid_channels, n_samples)
+                integration_channels = torch.full(
+                    (n_samples,), grid_index, device=device
                 )
-                integration_channels = torch.full((n_samples,), grid_index)
             elif self.integrator.multichannel:
                 channels = torch.cat(
                     [
-                        torch.full((samples_per_channel[channel_index],), channel_index)
+                        torch.full(
+                            (int(samples_per_channel[channel_index]),),
+                            channel_index,
+                            device=device,
+                        )
                         for channel_index in grid_channels
                     ]
                 )
@@ -401,9 +437,9 @@ class VegasPreTraining:
                         valid_channels, func_vals, torch.zeros_like(func_vals)
                     )
             else:
-                func_vals = torch.zeros((x.shape[0]), dtype=self.integrator.dummy.dtype)
-                y = torch.zeros_like(x_torch)
-                alphas = torch.zeros_like(x_torch)
+                func_vals = torch.zeros((n_samples,), dtype=dtype, device=device)
+                y = None
+                alphas = None
 
             # TODO: assign channels if importance-sampled
             if (
@@ -412,26 +448,23 @@ class VegasPreTraining:
             ):
                 func_vals *= len(grid_channels)
 
+            f = jac * func_vals
             if self.integrator.multichannel:
-                alpha = torch.gather(alphas, index=channels[:, None], dim=1)[:, 0]
-                f = jac * func_vals.numpy() * alpha.numpy()
-            else:
-                f = jac * func_vals.numpy()
+                f = f * self._channel_weight(func_vals, channels, alphas)
 
-            sample_batch = SampleBatch(
-                x_torch,
-                y,
-                torch.from_numpy(1 / jac),
-                func_vals,
-                channels,
-                alphas,
-                None,
-                integration_channels,
-                torch.from_numpy(f),
-                alphas,
-            )
             samples.append(
-                sample_batch.map(lambda t: t.to(self.integrator.dummy.device))
+                SampleBatch(
+                    x_torch,
+                    y,
+                    (1 / jac).to(dtype),
+                    func_vals,
+                    channels,
+                    alphas,
+                    None,
+                    integration_channels,
+                    f.to(dtype),
+                    alphas,
+                )
             )
         cat_samples = SampleBatch.cat(samples)
         if self.integrator.multichannel:
@@ -448,9 +481,9 @@ class VegasPreTraining:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.integrator.multichannel:
             n_channels = self.integrator.integration_channel_count
-            alphas = torch.gather(
-                samples.alphas, index=samples.channels[:, None], dim=1
-            )[:, 0]
+            alphas = self._channel_weight(
+                samples.func_vals, samples.channels, samples.alphas
+            )
             f_true = alphas * samples.func_vals
             f_div_q = f_true.detach() / samples.q_sample
             channels = (

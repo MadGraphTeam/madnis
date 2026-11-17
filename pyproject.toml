@@ -23,8 +23,6 @@ dependencies = [
   "torchtestcase",
 ]
 
-[project.optional-dependencies]
-vegas = ["vegas"]
 
 [tool.black]
 line-length = 88
