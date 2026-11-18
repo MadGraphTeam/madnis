@@ -198,6 +198,42 @@ def test_init_with_grid(multichannel):
             )
 
 
+@pytest.mark.parametrize("multichannel", [False, True])
+def test_init_with_grid_narrow_bins(multichannel):
+    """
+    A VEGAS grid with bins narrower than min_bin_width used to give NaN widths and infinite
+    derivatives in float32. The narrow bins are widened with a warning, and the flow stays
+    finite and still concentrates the samples at the peak of the grid.
+    """
+    torch.manual_seed(0)
+    channels = 2 if multichannel else None
+    flow = Flow(dims_in=2, bins=10, channels=channels)
+    # 64 bins of equal probability that pile up around 0.5, the innermost has width 1e-8
+    t = torch.linspace(-1, 1, 65)
+    edges = 0.5 + 0.5 * t.sign() * t.abs() ** 5
+    grid = torch.stack([edges, edges])
+    if multichannel:
+        grid = torch.stack([grid, grid])
+    assert grid.diff(dim=-1).min() < 1e-3 * flow.min_bin_width
+
+    with pytest.warns(UserWarning, match="narrower than min_bin_width"):
+        flow.init_with_grid(grid)
+
+    for param in flow.parameters():
+        assert torch.isfinite(param).all()
+    for channel in range(2 if multichannel else 1):
+        with torch.no_grad():
+            x, prob = flow.sample(
+                10000,
+                channel=channel if multichannel else None,
+                return_prob=True,
+            )
+        assert torch.isfinite(x).all() and torch.isfinite(prob).all()
+        # uniform sampling would put 10% of the points per dimension in this interval
+        in_peak = ((x - 0.5).abs() < 0.05).float().mean(dim=0)
+        assert (in_peak > 0.5).all()
+
+
 def test_gaussian_latent_flow_normalized():
     """a flow with Gaussian latent space is a normalized density on R^d"""
     torch.manual_seed(0)
