@@ -633,24 +633,28 @@ class Flow(nn.Module, Distribution):
         )
         rqs_grid = torch.cat((w_unnorm, h_unnorm, d_unnorm), dim=-1)
 
-        # Initialize weights and biases of the last layer of the subnets of the first
-        # two coupling blocks
-        if len(grid.shape) == 3:
-            weights_0 = self.subnets[0].weights[-1]
-            weights_1 = self.subnets[1].weights[-1]
-            biases_0 = self.subnets[0].biases[-1]
-            biases_1 = self.subnets[1].biases[-1]
-        else:
-            weights_0 = self.subnets[0].layers[-1].weight
-            weights_1 = self.subnets[1].layers[-1].weight
-            biases_0 = self.subnets[0].layers[-1].bias
-            biases_1 = self.subnets[1].layers[-1].bias
-        nn.init.zeros_(weights_0)
-        nn.init.zeros_(weights_1)
-        with torch.no_grad():
-            biases_0.copy_(
-                rqs_grid[..., ~self.condition_masks[0], :].flatten(start_dim=-2)
-            )
-            biases_1.copy_(
-                rqs_grid[..., ~self.condition_masks[1], :].flatten(start_dim=-2)
-            )
+        # Initialize weights and biases of the last layer of the subnets such that every
+        # dimension is mapped exactly once, by the first block that transforms it. For the
+        # default masks these are the first two blocks. For other masks (random permutations,
+        # one block per dimension) the first two blocks can overlap or miss dimensions.
+        # Dimensions that an earlier block already maps get zero biases, i.e. the identity.
+        covered = torch.zeros_like(self.condition_masks[0])
+        for k, mask in enumerate(self.condition_masks):
+            transformed = ~mask
+            new = transformed & ~covered
+            if not torch.any(new):
+                continue
+            if len(grid.shape) == 3:
+                weights = self.subnets[k].weights[-1]
+                biases = self.subnets[k].biases[-1]
+            else:
+                weights = self.subnets[k].layers[-1].weight
+                biases = self.subnets[k].layers[-1].bias
+            block_grid = rqs_grid[..., transformed, :].clone()
+            block_grid[..., ~new[transformed], :] = 0.0
+            nn.init.zeros_(weights)
+            with torch.no_grad():
+                biases.copy_(block_grid.flatten(start_dim=-2))
+            covered |= new
+            if torch.all(covered):
+                break
