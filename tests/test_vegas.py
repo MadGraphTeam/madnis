@@ -18,8 +18,6 @@ from .test_integrator import (
     two_peaks,
 )
 
-pytest.importorskip("vegas")
-
 
 def make_integrator(multichannel: bool) -> Integrator:
     torch.manual_seed(0)
@@ -178,3 +176,49 @@ def test_vegas_sampling_options():
     total, per_channel = vegas.unweighting_metrics(20000)
     assert len(per_channel) == 2
     assert 0 < total.uweff_after_cuts_partial <= 1
+
+
+def test_vegas_without_prior():
+    """
+    Without prior channel weights, VEGAS uses uniform channel weights, as the integrator does
+    without channel weight network
+    """
+    torch.manual_seed(0)
+    integrand = Integrand(
+        lambda x, channels: two_peaks(x), input_dim=2, channel_count=2
+    )
+    integrator = Integrator(integrand, batch_size=512, dtype=torch.float64)
+    vegas = VegasPreTraining(integrator)
+    vegas.train([5000] * 5)
+    assert_compatible(*vegas.integrate(100000), TWO_PEAKS_INTEGRAL)
+    samples = vegas.sample(10000)
+    assert samples.alphas is None
+    assert_weights_unbiased(vegas.sample(100000).weights, TWO_PEAKS_INTEGRAL)
+
+
+def test_vegas_sample_without_integrand_more_channels_than_dims():
+    """the dummy channel weights must have one column per channel, not per dimension"""
+    torch.manual_seed(0)
+    integrator = Integrator(grouped_integrand(), batch_size=512, dtype=torch.float64)
+    vegas = VegasPreTraining(integrator)
+    samples = vegas.sample(1000, evaluate_integrand=False)
+    assert integrator.integrand.channel_count > samples.x.shape[1]
+    assert (samples.func_vals == 0).all()
+    assert (samples.weights == 0).all()
+    assert samples.y is None and samples.alphas is None
+    assert set(samples.channels.tolist()) == {0, 1, 2, 3}
+
+
+def test_vegas_reproducible():
+    """VEGAS draws its random numbers from torch, so torch.manual_seed fixes the result"""
+
+    def run():
+        integrator = make_integrator(True)
+        vegas = VegasPreTraining(integrator)
+        vegas.train([1000] * 3)
+        return vegas.integrate(10000), vegas.grids.grid.clone()
+
+    (integral1, error1), grid1 = run()
+    (integral2, error2), grid2 = run()
+    assert integral1 == integral2 and error1 == error2
+    torch.testing.assert_close(grid1, grid2, rtol=0, atol=0)

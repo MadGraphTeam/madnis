@@ -139,8 +139,9 @@ faster than the training of a neural network using stochastic gradient descent. 
 our advantage in MadNIS by training a VEGAS grid first and then using it to initialize our
 normalizing flow, using the :py:class:`VegasPreTraining <madnis.integrator.VegasPreTraining>` class.
 It is constructed using an :py:class:`Integrator <madnis.integrator.Integrator>` instance and uses
-the same integrand, sample buffer and integration cache. It relies on the ``vegas`` package which is
-an optional dependency of MadNIS. The pre-training can be performed with the following code:
+the same integrand, sample buffer and integration cache. The VEGAS grids are implemented in torch
+and run on the device of the integrator. The grid adaptation follows the ``vegas`` package, which
+is not needed. The pre-training can be performed with the following code:
 
 .. code-block:: python
 
@@ -226,7 +227,22 @@ Device and data type
 The device and data type used for training and sampling can be set using the ``device`` and
 ``dtype`` arguments of the :py:class:`Integrator <madnis.integrator.Integrator>` constructor.
 As the class inherits from ``torch.nn.Module``, the ``to`` function can be used alternatively
-to change the device or data type.
+to change the device or data type. For example, to train on a GPU,
+
+.. skip: next
+
+.. code-block:: python
+
+    integrator = Integrator(
+        ..., # other arguments
+        device = "cuda"
+    )
+
+There is no need to change the default device with ``torch.set_default_device``. The integrand
+is called with tensors on the device of the integrator and has to return tensors on the same
+device. Tensors created inside the integrand should therefore use the device of its input, for
+example ``torch.zeros(len(x), device=x.device)`` or ``x.new_zeros(len(x))``. This also holds for
+the VEGAS pre-training.
 
 
 Storing and loading trained models
