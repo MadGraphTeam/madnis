@@ -1,4 +1,5 @@
 import math
+import warnings
 from collections.abc import Callable
 from typing import Literal, Protocol
 
@@ -598,45 +599,62 @@ class Flow(nn.Module, Distribution):
                 (d[..., :1], d[..., 1:][delete_mask].reshape(next_shape)), dim=-1
             )
 
-        # Invert softmax and softplus functions applied to subnet outputs
+        # Invert softmax and softplus functions applied to subnet outputs.
+        # Bins narrower than min_bin_width (or lower than min_bin_height) cannot be represented
+        # by the spline. Without clipping, the logarithm of a negative number gives NaN.
+        if torch.any(w <= self.min_bin_width):
+            warnings.warn(
+                "VEGAS grid has bins narrower than min_bin_width. They are widened to "
+                "min_bin_width. Consider a smaller min_bin_width."
+            )
         w_unnorm = torch.log(
-            (w - self.min_bin_width) / (1 - self.bins * self.min_bin_width)
+            torch.clip(w - self.min_bin_width, min=1e-3 * self.min_bin_width)
+            / (1 - self.bins * self.min_bin_width)
         )
         w_unnorm -= torch.mean(w_unnorm, dim=-1, keepdim=True)
         h_unnorm = torch.log(
-            (h - self.min_bin_height) / (1 - self.bins * self.min_bin_height)
+            torch.clip(h - self.min_bin_height, min=1e-3 * self.min_bin_height)
+            / (1 - self.bins * self.min_bin_height)
         )
         h_unnorm -= torch.mean(h_unnorm, dim=-1, keepdim=True)
-        d_unnorm = torch.log(
-            torch.clip(
-                torch.exp(
-                    (self.min_bin_derivative + math.log(2)) / d
-                    - self.min_bin_derivative
+        # Inverse softplus log(exp(y) - 1). For narrow VEGAS bins, d is small and y is large,
+        # so exp(y) overflows (y > 88.7 in float32) and the bias becomes inf. For y > 20,
+        # log(exp(y) - 1) = y up to corrections of order exp(-y).
+        y = (self.min_bin_derivative + math.log(2)) / d - self.min_bin_derivative
+        d_unnorm = torch.where(
+            y > 20.0,
+            y,
+            torch.log(
+                torch.clip(
+                    torch.expm1(torch.clamp(y, max=20.0)),
+                    min=self.min_bin_derivative * 1e-5,
                 )
-                - 1,
-                min=self.min_bin_derivative * 1e-5,
-            )
+            ),
         )
         rqs_grid = torch.cat((w_unnorm, h_unnorm, d_unnorm), dim=-1)
 
-        # Initialize weights and biases of the last layer of the subnets of the first
-        # two coupling blocks
-        if len(grid.shape) == 3:
-            weights_0 = self.subnets[0].weights[-1]
-            weights_1 = self.subnets[1].weights[-1]
-            biases_0 = self.subnets[0].biases[-1]
-            biases_1 = self.subnets[1].biases[-1]
-        else:
-            weights_0 = self.subnets[0].layers[-1].weight
-            weights_1 = self.subnets[1].layers[-1].weight
-            biases_0 = self.subnets[0].layers[-1].bias
-            biases_1 = self.subnets[1].layers[-1].bias
-        nn.init.zeros_(weights_0)
-        nn.init.zeros_(weights_1)
-        with torch.no_grad():
-            biases_0.copy_(
-                rqs_grid[..., ~self.condition_masks[0], :].flatten(start_dim=-2)
-            )
-            biases_1.copy_(
-                rqs_grid[..., ~self.condition_masks[1], :].flatten(start_dim=-2)
-            )
+        # Initialize weights and biases of the last layer of the subnets such that every
+        # dimension is mapped exactly once, by the first block that transforms it. For the
+        # default masks these are the first two blocks. For other masks (random permutations,
+        # one block per dimension) the first two blocks can overlap or miss dimensions.
+        # Dimensions that an earlier block already maps get zero biases, i.e. the identity.
+        covered = torch.zeros_like(self.condition_masks[0])
+        for k, mask in enumerate(self.condition_masks):
+            transformed = ~mask
+            new = transformed & ~covered
+            if not torch.any(new):
+                continue
+            if len(grid.shape) == 3:
+                weights = self.subnets[k].weights[-1]
+                biases = self.subnets[k].biases[-1]
+            else:
+                weights = self.subnets[k].layers[-1].weight
+                biases = self.subnets[k].layers[-1].bias
+            block_grid = rqs_grid[..., transformed, :].clone()
+            block_grid[..., ~new[transformed], :] = 0.0
+            nn.init.zeros_(weights)
+            with torch.no_grad():
+                biases.copy_(block_grid.flatten(start_dim=-2))
+            covered |= new
+            if torch.all(covered):
+                break
