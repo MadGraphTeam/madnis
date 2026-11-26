@@ -62,6 +62,52 @@ The output is
     Batch 100: loss=0.01639
     Integration result: 1.00335 +- 0.00127
 
+Detailed training information
+-----------------------------
+
+Besides the loss, the :py:class:`TrainingStatus <madnis.integrator.TrainingStatus>` contains
+detailed information about every training step. It is computed from the samples of the step, so no
+additional integrand evaluations are needed. For example, ``status.integration`` contains the
+channel-wise integrals, errors and relative standard deviations of the online batch, in the same
+form as the ``integration_metrics`` function. The status also contains the number of generated
+samples and of samples with non-zero integrand, the cut efficiency, the fraction of negative
+weights, the norm of the gradients, the state of the buffer and the wall times of the sampling,
+the integrand evaluation and the optimization. Buffered training steps do not generate new
+samples, so their integration metrics are ``None``. For a regular summary of the training, the
+:py:class:`StatusPrinter <madnis.integrator.StatusPrinter>` callback can be used,
+
+.. code-block:: python
+
+    from madnis.integrator import StatusPrinter
+
+    integrator = Integrator(lambda x: (2*x).prod(dim=1), dims=4)
+    integrator.train(100, callback=StatusPrinter(interval=20))
+
+which prints a line for every 20 training steps,
+
+.. code-block:: text
+
+    step     20 | loss 4.5462e-01 | integral 1.002189e+00 +- 6.08e-03 | rel. std. 0.9725 | cut eff. 1.0000 | 30.4 ms/step
+    step     40 | loss 1.2689e-01 | integral 1.003055e+00 +- 3.18e-03 | rel. std. 0.4717 | cut eff. 1.0000 | 27.8 ms/step
+    step     60 | loss 5.7077e-02 | integral 9.980110e-01 +- 2.09e-03 | rel. std. 0.3031 | cut eff. 1.0000 | 22.9 ms/step
+    step     80 | loss 3.2632e-02 | integral 9.991886e-01 +- 1.55e-03 | rel. std. 0.2238 | cut eff. 1.0000 | 33.4 ms/step
+    step    100 | loss 2.2355e-02 | integral 9.986240e-01 +- 1.31e-03 | rel. std. 0.1900 | cut eff. 1.0000 | 25.4 ms/step
+
+The integral in every line combines the batches of the last 20 steps. The totals since the start of
+the training are returned by the ``statistics`` method,
+
+.. code-block:: python
+
+    statistics = integrator.statistics()
+    print(f"{statistics.integrand_calls} integrand calls in {statistics.timing.total:.2f} s")
+    print(f"Integration result: {statistics.integral:.5f} +- {statistics.error:.5f}")
+
+The unweighting efficiency of every online batch is only computed with
+``unweighting_status=True``, because it requires a loop over the channels. It is then also shown
+by the ``StatusPrinter``. On GPUs, operations run asynchronously, so the split of the time between
+sampling, integrand and optimization is only exact with ``detailed_timing=True``, which
+synchronizes the device before and after every phase. The total time per step is always exact.
+
 
 Computing the integral with more statistics
 -------------------------------------------

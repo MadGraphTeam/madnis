@@ -23,11 +23,15 @@ from .metrics import (
     truncated_max_weight,
     unweighting_metrics,
 )
+from .monitoring import StatusPrinter, StepTiming, TrainingStatistics
 from .vegas_pretraining import VegasPreTraining
 
 __all__ = [
     "Integrator",
     "TrainingStatus",
+    "TrainingStatistics",
+    "StepTiming",
+    "StatusPrinter",
     "SampleBatch",
     "Integrand",
     "Buffer",
