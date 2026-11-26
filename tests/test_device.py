@@ -17,7 +17,10 @@ from madnis.integrator import ChannelGrouping, Integrand, Integrator
 from madnis.nn import Flow
 
 SIGMA = 0.1
-DEVICES = ["meta-check"] + (["cuda"] if torch.cuda.is_available() else [])
+# Before torch 2.13, Adam creates its step counter on the default device and calls .item() on
+# it, so the meta check fails inside torch itself.
+META_CHECK = ["meta-check"] if torch.__version__ >= (2, 13) else []
+DEVICES = META_CHECK + (["cuda"] if torch.cuda.is_available() else [])
 
 
 @contextmanager
