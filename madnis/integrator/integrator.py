@@ -1,9 +1,12 @@
+import dataclasses
 import itertools
 import math
 import signal
+import time
 import warnings
-from collections.abc import Callable, Iterable
-from dataclasses import astuple, dataclass
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
+from dataclasses import astuple, dataclass, field
 from typing import Any, Literal
 
 import numpy as np
@@ -23,6 +26,7 @@ from .metrics import (
     integration_metrics,
     unweighting_metrics,
 )
+from .monitoring import StepTiming, TrainingStatistics, peak_memory, synchronize
 
 # Decay factor of the moving averages used to estimate the channel-wise cut efficiencies
 EFFICIENCY_DECAY = 0.8
@@ -31,7 +35,11 @@ EFFICIENCY_DECAY = 0.8
 @dataclass
 class TrainingStatus:
     """
-    Contains the MadNIS training status to pass it to a callback function.
+    Contains the MadNIS training status to pass it to a callback function. It is returned by
+    ``Integrator.train_step`` and passed to the callback of ``Integrator.train``. All quantities
+    are computed from the samples of the training step, without evaluating the integrand at
+    additional points. Buffered steps do not generate new samples, so the integration metrics
+    and sample counts are only available for online steps.
 
     Args:
         step: optimization step
@@ -39,6 +47,28 @@ class TrainingStatus:
         buffered: whether the optimization was performed on buffered samples
         learning_rate: current learning rate if learning rate scheduler is present
         dropped_channels: number of channels dropped after this optimization step
+        integration: integration metrics of the online batch, with channel-wise integrals,
+            errors and relative standard deviations. None for buffered steps.
+        unweighting: unweighting metrics of the online batch, combined over all channels. Only
+            computed with ``unweighting_status=True`` in the ``Integrator``, otherwise None.
+        channel_unweighting: channel-wise unweighting metrics of the online batch for
+            multi-channel integrals, computed like ``unweighting``
+        sample_count: number of samples generated in this step, including samples with zero
+            integrand. This is the number of integrand evaluations.
+        nonzero_count: number of generated samples with non-zero integrand
+        invalid_count: number of invalid integrand values that were set to zero, see the
+            ``invalid_integrand`` argument of the ``Integrator``
+        channel_sample_counts: channel-wise ``sample_count`` for multi-channel integrals
+        channel_nonzero_counts: channel-wise ``nonzero_count`` for multi-channel integrals
+        negative_weight_fraction: fraction of negative weights among the non-zero weights of
+            the online batch
+        grad_norm: norm of the gradients before clipping, or None if the step was skipped
+        grad_clipped: whether the gradients were clipped, see ``grad_clip_threshold``
+        skipped: whether the optimization was skipped because the loss was nan
+        buffer_size: number of samples in the buffer after this step
+        buffer_stored: number of samples stored in the buffer in this step
+        active_channels: number of active channels for multi-channel integrals
+        timing: wall times of the training step
     """
 
     step: int
@@ -46,6 +76,47 @@ class TrainingStatus:
     buffered: bool
     learning_rate: float | None
     dropped_channels: int
+    integration: IntegrationMetrics | None = None
+    unweighting: UnweightingMetrics | None = None
+    channel_unweighting: list[UnweightingMetrics] | None = None
+    sample_count: int = 0
+    nonzero_count: int = 0
+    invalid_count: int = 0
+    channel_sample_counts: list[int] | None = None
+    channel_nonzero_counts: list[int] | None = None
+    negative_weight_fraction: float | None = None
+    grad_norm: float | None = None
+    grad_clipped: bool = False
+    skipped: bool = False
+    buffer_size: int = 0
+    buffer_stored: int = 0
+    active_channels: int | None = None
+    timing: StepTiming = field(default_factory=StepTiming)
+
+    @property
+    def cut_efficiency(self) -> float | None:
+        """Fraction of the generated samples with non-zero integrand, None for buffered steps"""
+        if self.sample_count == 0:
+            return None
+        return self.nonzero_count / self.sample_count
+
+
+@dataclass
+class _StepRecord:
+    """Information collected during a training step to build the ``TrainingStatus``"""
+
+    timing: StepTiming = field(default_factory=StepTiming)
+    collect_weights: bool = False
+    weights: torch.Tensor | None = None
+    weight_channels: torch.Tensor | None = None
+    zero_counts: torch.Tensor | None = None
+    sample_counts: torch.Tensor | None = None
+    nonzero_counts: torch.Tensor | None = None
+    invalid_count: int = 0
+    grad_norm: float | None = None
+    grad_clipped: bool = False
+    skipped: bool = False
+    buffer_stored: int = 0
 
 
 @dataclass
@@ -188,6 +259,9 @@ class Integrator(nn.Module):
         rescale_dropped_zeros: bool = True,
         buffer_unweighting_quantile: float | None = None,
         grad_clip_threshold: float | None = None,
+        invalid_integrand: Literal["raise", "zero"] = "raise",
+        detailed_timing: bool = False,
+        unweighting_status: bool = False,
     ):
         """
         Args:
@@ -282,11 +356,27 @@ class Integrator(nn.Module):
                 Hence, the root mean square of the gradient components is at most
                 ``grad_clip_threshold``. This is the gradient clipping of MadGraph7, which uses
                 0.003.
+            invalid_integrand: Behavior for invalid integrand values, i.e. non-finite integrand
+                values, negative or non-finite prior channel weights, and prior channel weights
+                that are all zero at points with non-zero integrand. With "raise", an exception
+                is raised. With "zero", the integrand is set to zero at these points, as
+                MadGraph7 does for invalid reweighting factors, and they are counted in the
+                training status and statistics. This biases the integral by the contribution of
+                these points.
+            detailed_timing: If True, the device is synchronized before and after every timed
+                phase of a training step, such that the times of the sampling, integrand and
+                optimization are exact on GPUs. This slows down the training slightly. Without
+                it, the times are still exact on CPUs, and the total time is always exact.
+            unweighting_status: If True, the training status contains the unweighting metrics of
+                every online batch. They require a loop over the channels and are therefore not
+                computed by default.
         """
         super().__init__()
 
         if grad_clip_threshold is not None and grad_clip_threshold < 0:
             raise ValueError("grad_clip_threshold must not be negative")
+        if invalid_integrand not in ("raise", "zero"):
+            raise ValueError(f"Unknown invalid_integrand mode {invalid_integrand}")
         if not isinstance(integrand, Integrand):
             integrand = Integrand(integrand, dims)
         self.integrand = integrand
@@ -434,6 +524,11 @@ class Integrator(nn.Module):
         self.drop_zero_integrands = drop_zero_integrands
         self.rescale_dropped_zeros = rescale_dropped_zeros
         self.grad_clip_threshold = grad_clip_threshold or None
+        self.invalid_integrand = invalid_integrand
+        self.detailed_timing = detailed_timing
+        self.unweighting_status = unweighting_status
+        self._record: _StepRecord | None = None
+        self._statistics = TrainingStatistics()
         self.batch_size_threshold = batch_size_threshold
         self.max_oversampling = max_oversampling
         # Exponential moving averages of the channel-wise number of generated samples and of
@@ -572,42 +667,65 @@ class Integrator(nn.Module):
         x: torch.Tensor,
         func_vals: torch.Tensor,
         alphas_prior: torch.Tensor | None,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
-        Checks the values returned by the integrand and raises an exception for values that
-        cannot be integrated: non-finite integrand values, negative or non-finite prior channel
-        weights, and prior channel weights that are all zero at points with non-zero integrand.
-        Like in MadGraph7, the integration is aborted in these cases, because they cannot be
-        recovered from by sampling further and ignoring them would bias the result.
+        Checks the values returned by the integrand for values that cannot be integrated:
+        non-finite integrand values, negative or non-finite prior channel weights, and prior
+        channel weights that are all zero at points with non-zero integrand. With
+        ``invalid_integrand="raise"``, an exception is raised, because these points cannot be
+        recovered from by sampling further and ignoring them would bias the result. With
+        ``invalid_integrand="zero"``, the integrand and the prior channel weights are set to zero
+        at these points, and they are counted.
 
         Args:
             x: sampled points, shape (n, input_dim)
             func_vals: integrand values, shape (n, )
             alphas_prior: prior channel weights, shape (n, channels), or None
+        Returns:
+            tuple of the integrand values and prior channel weights, with invalid points set to
+            zero if ``invalid_integrand="zero"``
         """
         n = len(func_vals)
         non_finite = ~torch.isfinite(func_vals)
+        if alphas_prior is None:
+            invalid_alphas = None
+            all_zero = None
+        else:
+            invalid_alphas = (~torch.isfinite(alphas_prior) | (alphas_prior < 0)).any(
+                dim=1
+            )
+            all_zero = (alphas_prior.sum(dim=1) == 0) & (func_vals != 0)
+
+        if self.invalid_integrand == "zero":
+            invalid = non_finite
+            if alphas_prior is not None:
+                invalid = invalid | invalid_alphas | all_zero
+                alphas_prior = torch.where(invalid_alphas[:, None], 0.0, alphas_prior)
+            invalid_count = int(invalid.sum().item())
+            self._statistics.invalid_samples += invalid_count
+            if self._record is not None:
+                self._record.invalid_count += invalid_count
+            return torch.where(invalid, 0.0, func_vals), alphas_prior
+
         if non_finite.any():
             raise ValueError(
                 f"The integrand returned {non_finite.sum().item()} non-finite values (nan or "
                 f"inf) for {n} points, for example at x = {x[non_finite][0].tolist()}. A "
                 "non-finite value cannot be integrated, so MadNIS stops here. This usually "
                 "means that the integrand or the phase-space mapping is not defined at some "
-                "points, for example at a threshold or for a zero or negative width."
+                "points, for example at a threshold or for a zero or negative width. Use "
+                'invalid_integrand="zero" to set these values to zero instead.'
             )
         if alphas_prior is None:
-            return
-        invalid = ~torch.isfinite(alphas_prior) | (alphas_prior < 0)
-        if invalid.any():
-            invalid_points = invalid.any(dim=1)
+            return func_vals, alphas_prior
+        if invalid_alphas.any():
             raise ValueError(
                 f"The integrand returned negative or non-finite prior channel weights for "
-                f"{invalid_points.sum().item()} of {n} points, for example "
-                f"{alphas_prior[invalid_points][0].tolist()} at x = "
-                f"{x[invalid_points][0].tolist()}. Prior channel weights have to be "
+                f"{invalid_alphas.sum().item()} of {n} points, for example "
+                f"{alphas_prior[invalid_alphas][0].tolist()} at x = "
+                f"{x[invalid_alphas][0].tolist()}. Prior channel weights have to be "
                 "non-negative and finite."
             )
-        all_zero = (alphas_prior.sum(dim=1) == 0) & (func_vals != 0)
         if all_zero.any():
             raise ValueError(
                 f"The prior channel weights are all zero for {all_zero.sum().item()} of {n} "
@@ -615,6 +733,46 @@ class Integrator(nn.Module):
                 f"{x[all_zero][0].tolist()}. At least one channel needs a positive prior "
                 "weight wherever the integrand is non-zero."
             )
+        return func_vals, alphas_prior
+
+    @contextmanager
+    def _timed(self, phase: str) -> Iterator[None]:
+        """
+        Adds the wall time of the enclosed code to the given phase of the current training
+        step. Does nothing outside of training steps.
+
+        Args:
+            phase: name of the field of ``StepTiming``
+        """
+        record = self._record
+        if record is None:
+            yield
+            return
+        if self.detailed_timing:
+            synchronize(self.dummy.device)
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            if self.detailed_timing:
+                synchronize(self.dummy.device)
+            setattr(
+                record.timing,
+                phase,
+                getattr(record.timing, phase) + time.perf_counter() - start,
+            )
+
+    def _trained_parameters(self) -> list[torch.Tensor]:
+        """
+        Returns:
+            parameters of the optimizer that are trained and have gradients
+        """
+        return [
+            param
+            for group in self.optimizer.param_groups
+            for param in group["params"]
+            if param.requires_grad and param.grad is not None
+        ]
 
     def _cwnet_input(self, samples: SampleBatch) -> torch.Tensor:
         """
@@ -700,6 +858,12 @@ class Integrator(nn.Module):
                     * (total_counts / counts.clip(min=1)).to(f_div_q.dtype)[channels]
                 )
             counts = total_counts
+        record = self._record
+        if record is not None and record.collect_weights:
+            record.weights = f_div_q
+            record.weight_channels = channels
+            record.zero_counts = zero_counts
+            record.collect_weights = False
         means = torch.bincount(
             channels, weights=f_div_q, minlength=n_channels
         ) / counts.clip(min=1)
@@ -729,6 +893,14 @@ class Integrator(nn.Module):
               - channel-wise variances of the integral, shape (channels, )
               - channel-wise number of samples, shape (channels, )
         """
+        with self._timed("optimization"):
+            return self._optimization_step_untimed(samples)
+
+    def _optimization_step_untimed(
+        self,
+        samples: SampleBatch,
+    ) -> tuple[float, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Implementation of ``_optimization_step`` without timing"""
         self.optimizer.zero_grad()
         # TODO: depending on the loss function and for drop_zero_weights=False, we can encounter
         # zero-weight events here and it might be sufficient to evaluate the flow for events with
@@ -754,10 +926,21 @@ class Integrator(nn.Module):
         )
         if loss.isnan().item():
             warnings.warn("nan batch: skipping optimization")
+            if self._record is not None:
+                self._record.skipped = True
         else:
             loss.backward()
             if self.grad_clip_threshold is not None:
                 self._clip_gradients()
+            elif self._record is not None:
+                grads = [param.grad for param in self._trained_parameters()]
+                self._record.grad_norm = (
+                    torch.linalg.vector_norm(
+                        torch.stack([torch.linalg.vector_norm(grad) for grad in grads])
+                    ).item()
+                    if len(grads) > 0
+                    else 0.0
+                )
             self.optimizer.step()
         return loss.item(), means, variances, counts
 
@@ -771,16 +954,14 @@ class Integrator(nn.Module):
         Returns:
             global norm of the gradients before clipping
         """
-        params = [
-            param
-            for group in self.optimizer.param_groups
-            for param in group["params"]
-            if param.requires_grad and param.grad is not None
-        ]
+        params = self._trained_parameters()
         param_count = sum(param.numel() for param in params)
-        return nn.utils.clip_grad_norm_(
-            params, self.grad_clip_threshold * math.sqrt(param_count)
-        )
+        max_norm = self.grad_clip_threshold * math.sqrt(param_count)
+        norm = nn.utils.clip_grad_norm_(params, max_norm)
+        if self._record is not None:
+            self._record.grad_norm = norm.item()
+            self._record.grad_clipped = self._record.grad_norm > max_norm
+        return norm
 
     def _restore_prior(self, samples: SampleBatch) -> torch.Tensor:
         """
@@ -903,6 +1084,8 @@ class Integrator(nn.Module):
             samples = self._unweight_for_buffer(samples)
             if samples.x.shape[0] == 0:
                 return
+        if self._record is not None:
+            self._record.buffer_stored = samples.x.shape[0]
 
         if (
             self.max_stored_channel_weights is not None
@@ -1108,10 +1291,12 @@ class Integrator(nn.Module):
         weight_factor = None
         if self.integrand.function_includes_sampling:
             integration_channels = batch_channels
-            x, prob, weight, y, alphas_prior, channels = self.integrand.function(
-                batch_channels
-            )
-            self._check_integrand_output(x, weight, alphas_prior)
+            with self._timed("integrand"):
+                x, prob, weight, y, alphas_prior, channels = self.integrand.function(
+                    batch_channels
+                )
+            self._statistics.integrand_calls += n
+            weight, alphas_prior = self._check_integrand_output(x, weight, alphas_prior)
         else:
             if self.group_channels and self.group_channels_uniform:
                 group_sizes = self.channel_group_sizes[batch_channels]
@@ -1125,7 +1310,7 @@ class Integrator(nn.Module):
             else:
                 channels = batch_channels
 
-            with torch.no_grad():
+            with torch.no_grad(), self._timed("sampling"):
                 x, prob = self.flow.sample(
                     n,
                     channel=channels,
@@ -1140,8 +1325,12 @@ class Integrator(nn.Module):
                     x, batch_channels
                 )
             if evaluate_integrand:
-                weight, y, alphas_prior = self.integrand(x, channels)
-                self._check_integrand_output(x, weight, alphas_prior)
+                with self._timed("integrand"):
+                    weight, y, alphas_prior = self.integrand(x, channels)
+                self._statistics.integrand_calls += n
+                weight, alphas_prior = self._check_integrand_output(
+                    x, weight, alphas_prior
+                )
                 if valid_channels is not None:
                     weight = torch.where(
                         valid_channels, weight, torch.zeros_like(weight)
@@ -1262,6 +1451,12 @@ class Integrator(nn.Module):
         channels = self._batch_channels(samples)
         nonzero = samples.func_vals != 0
         self._update_efficiencies(channels, nonzero)
+        if self._record is not None:
+            n_channels = self.integration_channel_count or 1
+            self._record.sample_counts = torch.bincount(channels, minlength=n_channels)
+            self._record.nonzero_counts = torch.bincount(
+                channels[nonzero], minlength=n_channels
+            )
         if self.drop_zero_integrands:
             zero_counts = torch.bincount(
                 channels[~nonzero], minlength=self.integration_channel_count or 1
@@ -1318,7 +1513,42 @@ class Integrator(nn.Module):
         Returns:
             Training status
         """
+        self._record = _StepRecord()
+        if self.detailed_timing:
+            synchronize(self.dummy.device)
+        start = time.perf_counter()
+        try:
+            status, online_metrics = self._train_step()
+            if self.detailed_timing:
+                synchronize(self.dummy.device)
+        finally:
+            record = self._record
+            self._record = None
+        record.timing.total = time.perf_counter() - start
+        self._complete_status(status, record, online_metrics)
 
+        statistics = self._statistics
+        if status.buffered:
+            statistics.buffered_steps += 1
+        else:
+            statistics.online_steps += 1
+        if status.skipped:
+            statistics.skipped_steps += 1
+        statistics.training_samples += status.sample_count
+        statistics.nonzero_samples += status.nonzero_count
+        statistics.timing.add(status.timing)
+        return status
+
+    def _train_step(
+        self,
+    ) -> tuple[TrainingStatus, tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None]:
+        """
+        Implementation of ``train_step``
+
+        Returns:
+            Training status with the basic information, and the channel-wise means, variances
+            and counts of the online batch, or None for buffered steps
+        """
         if self.step == self.freeze_cwnet_iteration and self.cwnet is not None:
             for param in self.cwnet.parameters():
                 param.requires_grad = False
@@ -1328,9 +1558,11 @@ class Integrator(nn.Module):
             samples = self._get_samples(
                 self.batch_size, self.uniform_channel_ratio, train=True
             )
+            self._record.collect_weights = True
             loss, means, variances, counts = self._optimization_step(samples)
             self._store_samples(samples)
             self.integration_history.store(means[None], variances[None], counts[None])
+            online_metrics = (means, variances, counts)
 
             if self.buffered_steps != 0 and self.buffer.size > self.minimum_buffer_size:
                 self.step_type_count += 1
@@ -1338,6 +1570,7 @@ class Integrator(nn.Module):
             buffered = True
             samples = SampleBatch(*self.buffer.sample(self._buffered_counts()))
             loss, _, _, _ = self._optimization_step(samples)
+            online_metrics = None
             self.step_type_count = (self.step_type_count + 1) % (
                 self.buffered_steps + 1
             )
@@ -1356,7 +1589,67 @@ class Integrator(nn.Module):
         if self.scheduler is not None:
             self.scheduler.step()
         self.step += 1
-        return status
+        return status, online_metrics
+
+    def _complete_status(
+        self,
+        status: TrainingStatus,
+        record: _StepRecord,
+        online_metrics: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    ):
+        """
+        Adds the information collected during a training step to the training status
+
+        Args:
+            status: training status to complete
+            record: information collected during the training step
+            online_metrics: channel-wise means, variances and counts of the online batch, or
+                None for buffered steps
+        """
+        status.invalid_count = record.invalid_count
+        status.grad_norm = record.grad_norm
+        status.grad_clipped = record.grad_clipped
+        status.skipped = record.skipped
+        status.buffer_size = 0 if self.buffer is None else self.buffer.size
+        status.buffer_stored = record.buffer_stored
+        if self.multichannel:
+            status.active_channels = int(self.active_channels_mask.sum().item())
+        status.timing = record.timing
+        if online_metrics is None:
+            return
+
+        status.integration = integration_metrics(*online_metrics)
+        status.sample_count = int(record.sample_counts.sum().item())
+        status.nonzero_count = int(record.nonzero_counts.sum().item())
+        if self.multichannel:
+            status.channel_sample_counts = record.sample_counts.tolist()
+            status.channel_nonzero_counts = record.nonzero_counts.tolist()
+
+        weights = record.weights
+        nonzero_weights = int(torch.count_nonzero(weights).item())
+        if nonzero_weights > 0:
+            status.negative_weight_fraction = (
+                int(torch.count_nonzero(weights < 0).item()) / nonzero_weights
+            )
+
+        if self.unweighting_status:
+            channels = record.weight_channels
+            if record.zero_counts is not None:
+                # the dropped samples enter the unweighting metrics with zero weight
+                zero_channels = torch.repeat_interleave(
+                    torch.arange(len(record.zero_counts), device=channels.device),
+                    record.zero_counts,
+                )
+                weights = torch.cat(
+                    (weights, torch.zeros_like(zero_channels, dtype=weights.dtype))
+                )
+                channels = torch.cat((channels, zero_channels))
+            if self.multichannel:
+                status.unweighting, status.channel_unweighting = unweighting_metrics(
+                    weights, channels, self.integration_channel_count
+                )
+            else:
+                status.unweighting = unweighting_metrics(weights)
 
     def train(
         self,
@@ -1438,6 +1731,29 @@ class Integrator(nn.Module):
             )
         self.integration_history.store(means[None], variances[None], counts[None])
         return integration_metrics(means, variances, counts)
+
+    def statistics(self) -> TrainingStatistics:
+        """
+        Returns totals since the integrator was created, for example the number of integrand
+        evaluations, the cut efficiency and the accumulated timing of the training steps,
+        together with the current estimate of the integral and of the channel-wise cut
+        efficiencies.
+
+        Returns:
+            ``TrainingStatistics`` object, see its documentation for details
+        """
+        statistics = dataclasses.replace(
+            self._statistics, timing=dataclasses.replace(self._statistics.timing)
+        )
+        if self.integration_history.size > 0:
+            statistics.integral, statistics.error = self.integral()
+        statistics.channel_cut_efficiencies = torch.where(
+            self._generated_ema > 0,
+            self._nonzero_ema / self._generated_ema.clip(min=1e-30),
+            torch.nan,
+        ).tolist()
+        statistics.peak_memory = peak_memory(self.dummy.device)
+        return statistics
 
     def integral(self) -> tuple[float, float]:
         """

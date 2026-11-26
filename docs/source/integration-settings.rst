@@ -199,10 +199,27 @@ Invalid integrand values
 MadNIS checks the values returned by the integrand and raises an exception if they cannot be
 integrated. This is the case for non-finite integrand values (nan or inf), for negative or
 non-finite prior channel weights, and if all prior channel weights vanish at a point with non-zero
-integrand. As in MadGraph7, the integration is aborted, because ignoring these points would bias
-the result. The error message contains an example of an affected point. Prior channel weights
-that are all zero are allowed at points where the integrand is zero, for example for points that
-fail the cuts.
+integrand. By default, the integration is aborted, because ignoring these points would bias the
+result. The error message contains an example of an affected point. Prior channel weights that are
+all zero are allowed at points where the integrand is zero, for example for points that fail the
+cuts.
+
+If a small number of invalid points is expected and their contribution is negligible, they can be
+set to zero instead, as MadGraph7 does for invalid reweighting factors,
+
+.. skip: next
+
+.. code-block:: python
+
+    integrator = Integrator(
+        ..., # other arguments
+        invalid_integrand = "zero"
+    )
+
+The number of invalid points is then reported in the ``invalid_count`` field of the
+:py:class:`TrainingStatus <madnis.integrator.TrainingStatus>` and in the
+:py:class:`TrainingStatistics <madnis.integrator.TrainingStatistics>`, see
+:doc:`first-steps`.
 
 Device and data type
 --------------------
