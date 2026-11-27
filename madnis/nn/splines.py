@@ -47,26 +47,19 @@ def unconstrained_rational_quadratic_spline(
         of the transformation, both with shape (..., )
     """
     if not inverse:
-        inside_interval_mask = torch.all((inputs >= left) & (inputs <= right), dim=-1)
+        low, high = left, right
     else:
-        inside_interval_mask = torch.all((inputs >= bottom) & (inputs <= top), dim=-1)
+        low, high = bottom, top
+    inside = torch.all((inputs >= low) & (inputs <= high), dim=-1)[..., None]
 
-    outside_interval_mask = ~inside_interval_mask
-
-    outputs = torch.zeros_like(inputs)
-    logabsdet = torch.zeros_like(inputs)
-
-    outputs[outside_interval_mask] = inputs[outside_interval_mask]
-    logabsdet[outside_interval_mask] = 0
-
-    (
-        outputs[inside_interval_mask],
-        logabsdet[inside_interval_mask],
-    ) = rational_quadratic_spline(
-        inputs=inputs[inside_interval_mask],
-        unnormalized_widths=unnormalized_widths[inside_interval_mask, :],
-        unnormalized_heights=unnormalized_heights[inside_interval_mask, :],
-        unnormalized_derivatives=unnormalized_derivatives[inside_interval_mask, :],
+    # Evaluate the spline for all points and select with torch.where. Boolean-mask indexing would
+    # require a host synchronization on GPUs. The inputs are clamped such that the discarded
+    # values stay finite and do not contribute to the gradients.
+    spline_outputs, spline_logabsdet = rational_quadratic_spline(
+        inputs=inputs.clamp(low, high),
+        unnormalized_widths=unnormalized_widths,
+        unnormalized_heights=unnormalized_heights,
+        unnormalized_derivatives=unnormalized_derivatives,
         inverse=inverse,
         left=left,
         right=right,
@@ -75,6 +68,10 @@ def unconstrained_rational_quadratic_spline(
         min_bin_width=min_bin_width,
         min_bin_height=min_bin_height,
         min_derivative=min_derivative,
+    )
+    outputs = torch.where(inside, spline_outputs, inputs)
+    logabsdet = torch.where(
+        inside, spline_logabsdet, torch.zeros_like(spline_logabsdet)
     )
 
     return outputs, logabsdet

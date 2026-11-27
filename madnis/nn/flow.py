@@ -267,6 +267,15 @@ class Flow(nn.Module, Distribution):
         # registered as a buffer to move with the flow, but not part of the state dict to keep
         # it compatible with older checkpoints
         self.register_buffer("condition_masks", condition_masks, persistent=False)
+        # Integer indices of the conditioning and transformed dimensions of every block. Indexing
+        # with boolean masks requires a host synchronization on GPUs, integer indices do not.
+        for i, mask in enumerate(self.condition_masks):
+            self.register_buffer(
+                f"_cond_indices_{i}", torch.nonzero(mask)[:, 0], persistent=False
+            )
+            self.register_buffer(
+                f"_trafo_indices_{i}", torch.nonzero(~mask)[:, 0], persistent=False
+            )
 
         self.subnets = nn.ModuleList()
         # needed to get one fake dim when 1D only
@@ -368,14 +377,17 @@ class Flow(nn.Module, Distribution):
             channel_args = (channel,)
 
         batch_size = x.shape[0]
-        if inverse:
-            blocks = zip(reversed(self.condition_masks), reversed(self.subnets))
-        else:
-            blocks = zip(self.condition_masks, self.subnets)
-        for mask, subnet in blocks:
-            inv_mask = ~mask
-            x_trafo = x[:, inv_mask]
-            x_cond = x[:, mask] if self.dims_in > 1 else torch.ones_like(x_trafo)
+        block_ids = range(len(self.subnets))
+        for i in reversed(block_ids) if inverse else block_ids:
+            subnet = self.subnets[i]
+            cond_indices = getattr(self, f"_cond_indices_{i}")
+            trafo_indices = getattr(self, f"_trafo_indices_{i}")
+            x_trafo = x.index_select(1, trafo_indices)
+            x_cond = (
+                x.index_select(1, cond_indices)
+                if self.dims_in > 1
+                else torch.ones_like(x_trafo)
+            )
             if c is not None:
                 x_cond = torch.cat((x_cond, c), dim=1)
             subnet_out = subnet(x_cond, *channel_args).reshape(
@@ -395,7 +407,7 @@ class Flow(nn.Module, Distribution):
                 self.min_bin_height,
                 self.min_bin_derivative,
             )
-            x[:, inv_mask] = x_out
+            x.index_copy_(1, trafo_indices, x_out)
             jac += block_jac.sum(dim=1)
 
         if inverse:
